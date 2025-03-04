@@ -1,0 +1,3 @@
+neuroglancer
+numpy
+scipy
