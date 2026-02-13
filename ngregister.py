@@ -57,7 +57,7 @@ def flip_main_axis(s,axis_name):
         ])
 
 # Helper function for all transforms
-def apply_transform_to_layer(applied_transform_matrix):
+def apply_transform_to_layer(applied_transform_matrix, chain_backwards: bool = False):
     global viewer
     with viewer.txn() as v:
         if v.layers[v.selectedLayer.layer].layer.type == "annotation":
@@ -68,7 +68,10 @@ def apply_transform_to_layer(applied_transform_matrix):
         else:
             current_transform_matrix = np.eye(4)
             current_transform_matrix[:3,:4] = np.array(current_transform.matrix)
-        new_transform_matrix = applied_transform_matrix @ current_transform_matrix
+        if chain_backwards:
+            new_transform_matrix = current_transform_matrix @ applied_transform_matrix
+        else:
+            new_transform_matrix = applied_transform_matrix @ current_transform_matrix
         new_transform = neuroglancer.CoordinateSpaceTransform({"matrix": new_transform_matrix[:3,:4].tolist(), "outputDimensions": v.dimensions.to_json()})
         current_source_url = v.layers[v.selectedLayer.layer].layer.source[0].url
         v.layers[v.selectedLayer.layer].layer.source[0] = neuroglancer.LayerDataSource({"url": current_source_url, "transform": new_transform.to_json()})
