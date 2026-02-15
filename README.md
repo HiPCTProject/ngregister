@@ -9,6 +9,18 @@ Start a local Neuroglancer instance with pre-configured shortcuts for custom reg
 ## How to use
 
 - Install dependencies using a virtual environment and the [./requirements.txt](./requirements.txt) file.
+
+> [!TIP]
+> To support the most recent Neuroglancer states which load resources using, e.g. `gs://my-bucket/data.ome.zarr|zarr:`, you will need the development version of Neuroglancer, that can be installed using:
+>
+> ```bash
+> pip install git+https://github.com/google/neuroglancer.git
+> ```
+> 
+> You will require a build environment, including `node` and `Python.h`.
+> To install `node` on your system, use `nvm`.
+> If you use `uv` (`uv pip ...`), you should pick and install a `uv`-managed version of Python, as explained [here](https://docs.astral.sh/uv/guides/install-python/).
+
 - Start an interactive Python session with (blank state):
 
 ```bash
