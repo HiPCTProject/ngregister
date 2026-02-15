@@ -34,3 +34,10 @@ python -i ngregister.py --url "https://neuroglancer-demo.appspot.com/#!..."
 ```
 
 - Either save manually the JSON file from the web browser or get the Neuroglancer URL once you quit the interactive Python session.
+
+## Other related projects
+
+As of https://github.com/neuroscales/ngtools/pull/42, these features have been implemented in https://github.com/neuroscales/ngtools, which handles more complex use cases. https://github.com/HiPCTProject/ngregister can still be used as a standalone.
+
+> [!WARNING]
+> Keybindings are not yet uniformized between the two tools.
