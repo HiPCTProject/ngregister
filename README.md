@@ -37,7 +37,7 @@ python -i ngregister.py --url "https://neuroglancer-demo.appspot.com/#!..."
 
 ## Other related projects
 
-As of https://github.com/neuroscales/ngtools/pull/42, these features have been implemented in https://github.com/neuroscales/ngtools, which handles more complex use cases. https://github.com/HiPCTProject/ngregister can still be used as a standalone.
+As of https://github.com/neuroscales/ngtools/pull/42, these features have been implemented in [neuroscales/ngtools](https://github.com/neuroscales/ngtools), which handles more complex use cases. [HiPCTProject/ngregister](https://github.com/HiPCTProject/ngregister) can still be used as a standalone.
 
 > [!WARNING]
 > Keybindings are not yet uniformized between the two tools.
