@@ -18,8 +18,8 @@ Start a local Neuroglancer instance with pre-configured shortcuts for custom reg
 > ```
 > 
 > You will require a build environment, including `node` and `Python.h`.
-> To install `node` on your system, use `nvm`.
-> If you use `uv` (`uv pip ...`), you should pick and install a `uv`-managed version of Python, as explained [here](https://docs.astral.sh/uv/guides/install-python/).
+> To install `node` on your system, use [`nvm`](https://www.nvmnode.com/).
+> If you use [`uv`](https://docs.astral.sh/uv/) (`uv pip ...`), you should pick and install a `uv`-managed version of Python, as explained [here](https://docs.astral.sh/uv/guides/install-python/).
 
 - Start an interactive Python session with (blank state):
 
