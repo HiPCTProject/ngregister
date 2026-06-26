@@ -1,3 +1,5 @@
 neuroglancer
 numpy
 scipy
+cloud-volume
+SimpleITK

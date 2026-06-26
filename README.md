@@ -6,6 +6,18 @@ Start a local Neuroglancer instance with pre-configured shortcuts for custom reg
 - **Place** a translation landmark 📍 at the cursor 🖱️ (in the fixed volume) with **\<y\>**,<br />and **translate** the active layer at the position of the cursor 🖱️ to the landmark 📍 with **\<shift+t\>**.<br />You can delete manually the "\_\_LANDMARK\_\_" layer when done.
 - **Rotate** from the center 🎯 of the view around the <u>absolute</u> axis $z$ (resp. $x$ and $y$) clockwise 🔃 with **\<i\>** (resp. **\<j\>** and **\<k\>**). <br/>**Rotate** counter-clockwise 🔄 with **\<shift+i\>**, **\<shift+j\>**, **\<shift+k\>**.
 
+And an automated **refinement** step that fine-tunes the current alignment around a landmark using an affine [SimpleITK](https://simpleitk.org/) registration on subvolumes fetched with [CloudVolume](https://github.com/seung-lab/cloud-volume):
+
+- **Tag** the active layer as the **moving** layer (the one being refined) with **\<alt+m\>**, and as the **reference** (fixed) layer with **\<alt+r\>**. This prepends a `mov::` / `ref::` prefix to the layer name. Tagging is only needed when the moving/reference pair is ambiguous (more than two image layers); with exactly two image layers the selected one is the moving layer and the other is the reference.
+- **Place** a translation landmark 📍 with **\<y\>** to mark the region to refine, then in the interactive Python session call:
+
+  ```python
+  refine_registration()              # default: 200-voxel cube around the landmark
+  refine_registration(size_voxels=128)
+  ```
+
+  It fetches a small subvolume around the landmark from both layers, runs the registration, and composes the resulting affine correction onto the moving layer. The change is recorded in `__HISTORY__` like the manual gestures.
+
 ## How to use
 
 - Install dependencies using a virtual environment and the [./requirements.txt](./requirements.txt) file.
