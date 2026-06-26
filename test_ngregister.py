@@ -1,23 +1,29 @@
 """Tests for the registration refinement in ngregister.py.
 
-The end-to-end test builds two real precomputed volumes with
-``CloudVolume.from_numpy`` on the in-memory ``mem://`` backend (no disk), points
-a Neuroglancer state at them, and checks that ``refine_registration`` recovers a
-known injected shift. Running through real CloudVolume exercises the actual
-``[x, y, z, channel]`` axis ordering that the pipeline has to invert.
+The end-to-end tests build real volumes with TensorStore (precomputed and
+sharded zarr3) under a temporary directory, point a Neuroglancer state at them,
+and check that ``refine_registration`` recovers a known injected shift. Running
+through real TensorStore exercises the lazy open + small-cutout read path and
+the axis handling the pipeline has to invert -- including a zarr3 volume stored
+in reversed ``z, y, x`` order with a permuting layer transform.
 
 Run with: ``pytest test_ngregister.py``
 """
 
+import json
 import types
 
 import numpy as np
 import scipy.ndimage as ndi
 import neuroglancer
-from cloudvolume import CloudVolume
+import tensorstore as ts
 
 import ngregister
 
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 def _texture(shape=(100, 100, 100), seed=7):
     """A smooth, bandlimited random volume -- good signal for the MI metric."""
@@ -28,69 +34,200 @@ def _texture(shape=(100, 100, 100), seed=7):
     return vol
 
 
-def _make_mem_volume(path, array, resolution):
-    """Materialize a uint16 precomputed image at a mem:// cloudpath."""
-    data = np.ascontiguousarray((array * 60000).astype(np.uint16))
-    CloudVolume.from_numpy(
-        data, vol_path=path, resolution=resolution,
-        chunk_size=(64, 64, 64), layer_type="image", progress=False,
-    )
+def _u16(array):
+    return np.ascontiguousarray((array * 60000).astype(np.uint16))
 
 
-def _state_with_layers(fixed_path, moving_path, scales, landmark):
+def _write_precomputed(dirpath, array_xyz, resolution):
+    """Write a uint16 precomputed image (stored [x, y, z]); return source URL."""
+    data = _u16(array_xyz)
+    dataset = ts.open({
+        "driver": "neuroglancer_precomputed",
+        "kvstore": "file://" + str(dirpath) + "/",
+        "create": True, "delete_existing": True,
+        "scale_metadata": {"size": list(data.shape), "encoding": "raw",
+                           "resolution": list(resolution), "chunk_size": [64, 64, 64]},
+        "multiscale_metadata": {"data_type": "uint16", "num_channels": 1,
+                                "type": "image"},
+    }).result()
+    dataset[:, :, :, 0] = data
+    return "precomputed://file://" + str(dirpath) + "/"
+
+
+def _write_zarr3_sharded(dirpath, array_native, dimension_names):
+    """Write a sharded zarr3 array (stored in dimension_names order); return URL."""
+    data = _u16(array_native)
+    shape = list(data.shape)
+    inner = [min(50, s) for s in shape]              # multiple inner chunks per shard
+    shard = [(s + i - 1) // i * i for s, i in zip(shape, inner)]
+    ts.open({
+        "driver": "zarr3",
+        "kvstore": "file://" + str(dirpath) + "/",
+        "create": True, "delete_existing": True,
+        "metadata": {
+            "shape": shape,
+            "data_type": "uint16",
+            "chunk_grid": {"name": "regular",
+                           "configuration": {"chunk_shape": shard}},
+            "codecs": [{"name": "sharding_indexed", "configuration": {
+                "chunk_shape": inner,
+                "codecs": [{"name": "bytes",
+                            "configuration": {"endian": "little"}}]}}],
+            "dimension_names": dimension_names,
+        },
+    }).result()[...] = data
+    return "zarr3://file://" + str(dirpath) + "/"
+
+
+def _write_ome_zarr3_group(dirpath, array_xyz, resolution):
+    """Write a minimal OME-Zarr v3 multiscale group (level 0 array); return URL.
+
+    The source URL points at the *group*, so opening it as an array fails and
+    the refinement must resolve the level-0 dataset path from the metadata.
+    """
+    dirpath.mkdir(parents=True, exist_ok=True)
+    _write_zarr3_sharded(dirpath / "0", array_xyz, ["x", "y", "z"])
+    group_meta = {
+        "zarr_format": 3, "node_type": "group",
+        "attributes": {"ome": {"multiscales": [{"datasets": [{"path": "0"}]}]}},
+    }
+    (dirpath / "zarr.json").write_text(json.dumps(group_meta))
+    return "zarr3://file://" + str(dirpath) + "/"
+
+
+def _state(scales, landmark, fixed_layer, moving_layer):
     state = neuroglancer.ViewerState()
     state.dimensions = neuroglancer.CoordinateSpace(
-        names=["x", "y", "z"], units="nm", scales=scales,
-    )
+        names=["x", "y", "z"], units="nm", scales=scales)
     state.position = landmark
-    state.layers.append(
-        name="ref::fix",
-        layer=neuroglancer.ImageLayer(source="precomputed://" + fixed_path),
-    )
-    state.layers.append(
-        name="mov::mov",
-        layer=neuroglancer.ImageLayer(source="precomputed://" + moving_path),
-    )
+    state.layers.append(name="ref::fix", layer=fixed_layer)
+    state.layers.append(name="mov::mov", layer=moving_layer)
     state.layers.append(
         name="__LANDMARK__",
-        layer=neuroglancer.LocalAnnotationLayer(dimensions=state.dimensions),
-    )
+        layer=neuroglancer.LocalAnnotationLayer(dimensions=state.dimensions))
     state.layers["__LANDMARK__"].annotations.append(
-        neuroglancer.PointAnnotation(id="lm", point=landmark),
-    )
+        neuroglancer.PointAnnotation(id="lm", point=landmark))
     return state
 
 
-def test_refine_registration_recovers_known_shift(monkeypatch):
-    # Anisotropic voxel size (z twice x/y) to exercise the scale handling.
-    scales = [4, 4, 8]
-    shift_voxels = np.array([3.0, -2.0, 1.0])
+def _image_layer(url, matrix=None, dims=None):
+    if matrix is None:
+        return neuroglancer.ImageLayer(source=url)
+    source = neuroglancer.LayerDataSource(
+        url=url,
+        transform=neuroglancer.CoordinateSpaceTransform(
+            matrix=matrix, output_dimensions=dims))
+    return neuroglancer.ImageLayer(source=source)
 
-    vol = _texture()
-    moving = ndi.shift(vol, shift_voxels, order=1, mode="reflect")
 
-    fixed_path = "mem://ngregister-test/fixed"
-    moving_path = "mem://ngregister-test/moving"
-    _make_mem_volume(fixed_path, vol, scales)
-    _make_mem_volume(moving_path, moving, scales)
-
-    state = _state_with_layers(fixed_path, moving_path, scales, landmark=[50, 50, 50])
-    monkeypatch.setattr(ngregister, "viewer", types.SimpleNamespace(state=state))
-
-    correction = ngregister.refine_registration(size_voxels=60, apply=False)
-
+def _assert_cancels_shift(correction, shift_voxels):
     # The moving content is displaced by +shift; the correction must cancel it.
-    recovered = correction[:3, 3]
-    assert np.linalg.norm(recovered - (-shift_voxels)) < 1.0
-    # A pure translation: the affine's linear part stays ~identity.
+    assert np.linalg.norm(correction[:3, 3] - (-shift_voxels)) < 1.0
     assert np.allclose(correction[:3, :3], np.eye(3), atol=0.04)
 
 
-def test_source_url_to_cloudpath_strips_datatype_suffix():
-    assert ngregister.source_url_to_cloudpath(
-        "https://h/d.ome.zarr|zarr:") == "https://h/d.ome.zarr"
-    assert ngregister.source_url_to_cloudpath(
-        "precomputed://gs://b/p") == "precomputed://gs://b/p"
+# ---------------------------------------------------------------------------
+# End-to-end tests (real TensorStore volumes)
+# ---------------------------------------------------------------------------
+
+def test_refine_precomputed_recovers_shift(monkeypatch, tmp_path):
+    scales = [4, 4, 8]                                 # anisotropic z
+    shift = np.array([3.0, -2.0, 1.0])
+    vol = _texture()
+    moving = ndi.shift(vol, shift, order=1, mode="reflect")
+
+    fixed_url = _write_precomputed(tmp_path / "fixed", vol, scales)
+    moving_url = _write_precomputed(tmp_path / "moving", moving, scales)
+    state = _state(scales, [50, 50, 50],
+                   _image_layer(fixed_url), _image_layer(moving_url))
+    monkeypatch.setattr(ngregister, "viewer", types.SimpleNamespace(state=state))
+
+    correction = ngregister.refine_registration(size_voxels=60, apply=False)
+    _assert_cancels_shift(correction, shift)
+
+
+def test_refine_sharded_zarr3_recovers_shift(monkeypatch, tmp_path):
+    scales = [4, 4, 8]
+    shift = np.array([2.0, 1.0, -1.0])
+    vol = _texture()
+    moving = ndi.shift(vol, shift, order=1, mode="reflect")
+
+    # Stored [x, y, z] with matching dimension labels -> identity transform.
+    fixed_url = _write_zarr3_sharded(tmp_path / "fixed", vol, ["x", "y", "z"])
+    moving_url = _write_zarr3_sharded(tmp_path / "moving", moving, ["x", "y", "z"])
+    state = _state(scales, [50, 50, 50],
+                   _image_layer(fixed_url), _image_layer(moving_url))
+    monkeypatch.setattr(ngregister, "viewer", types.SimpleNamespace(state=state))
+
+    correction = ngregister.refine_registration(size_voxels=60, apply=False)
+    _assert_cancels_shift(correction, shift)
+
+
+def test_refine_zarr3_reversed_axes(monkeypatch, tmp_path):
+    """Moving volume stored in z,y,x order with a permuting layer transform.
+
+    This is the axis-ordering stress test: TensorStore returns the array in its
+    native [z, y, x] order, the transform maps that local order to global x,y,z,
+    and the refinement must still recover the shift.
+    """
+    scales = [4, 4, 8]
+    shift = np.array([3.0, -2.0, 1.0])                # in global x,y,z voxels
+    vol = _texture()
+    moving = ndi.shift(vol, shift, order=1, mode="reflect")
+
+    dims = neuroglancer.CoordinateSpace(names=["x", "y", "z"], units="nm", scales=scales)
+    fixed_url = _write_precomputed(tmp_path / "fixed", vol, scales)
+    # Store moving transposed to [z, y, x]; transform reverses local -> global.
+    moving_url = _write_zarr3_sharded(
+        tmp_path / "moving", np.transpose(moving, (2, 1, 0)), ["z", "y", "x"])
+    reverse = [[0, 0, 1, 0], [0, 1, 0, 0], [1, 0, 0, 0]]  # local z,y,x -> global x,y,z
+
+    state = _state(scales, [50, 50, 50],
+                   _image_layer(fixed_url),
+                   _image_layer(moving_url, matrix=reverse, dims=dims))
+    monkeypatch.setattr(ngregister, "viewer", types.SimpleNamespace(state=state))
+
+    correction = ngregister.refine_registration(size_voxels=60, apply=False)
+    _assert_cancels_shift(correction, shift)
+
+
+def test_refine_ome_multiscale_group(monkeypatch, tmp_path):
+    scales = [4, 4, 8]
+    shift = np.array([2.0, -1.0, 1.0])
+    vol = _texture()
+    moving = ndi.shift(vol, shift, order=1, mode="reflect")
+
+    fixed_url = _write_ome_zarr3_group(tmp_path / "fixed", vol, scales)
+    moving_url = _write_ome_zarr3_group(tmp_path / "moving", moving, scales)
+    state = _state(scales, [50, 50, 50],
+                   _image_layer(fixed_url), _image_layer(moving_url))
+    monkeypatch.setattr(ngregister, "viewer", types.SimpleNamespace(state=state))
+
+    correction = ngregister.refine_registration(size_voxels=60, apply=False)
+    _assert_cancels_shift(correction, shift)
+
+
+# ---------------------------------------------------------------------------
+# Unit tests
+# ---------------------------------------------------------------------------
+
+def test_split_source_url_handles_both_encodings():
+    assert ngregister.split_source_url("precomputed://gs://b/p") == (
+        "precomputed", "gs://b/p")
+    assert ngregister.split_source_url("zarr3://https://h/d.zarr") == (
+        "zarr3", "https://h/d.zarr")
+    assert ngregister.split_source_url("https://h/d.ome.zarr|zarr3:") == (
+        "zarr3", "https://h/d.ome.zarr")
+    # bare path becomes a file:// kvstore
+    assert ngregister.split_source_url("precomputed:///data/vol")[1] == "file:///data/vol"
+
+
+def test_source_url_to_spec_selects_driver_and_scale():
+    spec = ngregister.source_url_to_spec("precomputed://gs://b/p", mip=2)
+    assert spec == {"driver": "neuroglancer_precomputed",
+                    "kvstore": "gs://b/p", "scale_index": 2}
+    spec = ngregister.source_url_to_spec("zarr3://https://h/d.zarr")
+    assert spec["driver"] == "zarr3" and spec["kvstore"] == "https://h/d.zarr"
 
 
 def test_resolve_roles_prefers_name_prefixes():

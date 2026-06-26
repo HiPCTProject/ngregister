@@ -1,5 +1,5 @@
 neuroglancer
 numpy
 scipy
-cloud-volume
+tensorstore
 SimpleITK

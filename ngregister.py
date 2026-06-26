@@ -8,8 +8,9 @@ from scipy.spatial.transform import Rotation
 import datetime
 import atexit
 
+import json
 import SimpleITK as sitk
-from cloudvolume import CloudVolume
+import tensorstore as ts
 
 viewer = neuroglancer.Viewer()
 
@@ -251,7 +252,7 @@ def translate_layer_to_landmark(s):
             v.voxel_coordinates = landmark_position
 
 # ---------------------------------------------------------------------------
-# Registration refinement (CloudVolume + SimpleITK)
+# Registration refinement (TensorStore + SimpleITK)
 #
 # refine_registration() fetches a small subvolume around a landmark from a
 # reference and a moving layer, runs an affine SimpleITK registration, and
@@ -263,8 +264,11 @@ def translate_layer_to_landmark(s):
 #   annotation points) are in global/output voxel coordinates, ordered like
 #   viewer.dimensions. A layer's source[0].transform.matrix is a 3x4 affine
 #   mapping local voxel -> global voxel.
-# - CloudVolume: vol[x0:x1, y0:y1, z0:z1] returns a numpy array indexed
-#   [x, y, z, channel] on the layer's local voxel grid (x-first).
+# - TensorStore: opens the source lazily (precomputed, zarr, zarr3 incl.
+#   sharding, n5) and only the small cutout is read into memory. The returned
+#   array's axes follow the source's stored order, which is also the column
+#   order of the layer transform; dimension labels identify the channel axis to
+#   drop and confirm the spatial axes.
 # - SimpleITK: an Image is indexed (x, y, z), but GetImageFromArray /
 #   GetArrayFromImage use the reversed numpy order [z, y, x]. Geometry lives in
 #   physical space via origin / spacing / direction.
@@ -293,14 +297,131 @@ def mark_layer_moving(s):
 def mark_layer_reference(s):
     mark_active_layer(REFERENCE_PREFIX)
 
-def source_url_to_cloudpath(url):
-    """Turn a Neuroglancer source URL into a CloudVolume cloudpath.
+# Neuroglancer data-source format -> TensorStore driver.
+_DRIVER_BY_FORMAT = {
+    "precomputed": "neuroglancer_precomputed",
+    "zarr": "zarr",
+    "zarr2": "zarr",
+    "zarr3": "zarr3",
+    "n5": "n5",
+}
+# TensorStore kvstore URL schemes that can be passed through unchanged.
+_KVSTORE_SCHEMES = ("gs://", "s3://", "http://", "https://", "file://", "memory://")
+# Dimension-label names that are not spatial and are reduced to their first index.
+_NON_SPATIAL_LABELS = {"channel", "c", "t", "time"}
 
-    Strips a trailing "|<datatype>:" annotation used by newer Neuroglancer
-    zarr/n5 sources (e.g. "...data.ome.zarr|zarr:") and keeps the
-    "protocol://..." cloudpath that CloudVolume understands.
+
+def split_source_url(url):
+    """Split a Neuroglancer source URL into a (format, kvstore) pair.
+
+    Handles both encodings: the legacy ``<format>://<kvstore>`` (e.g.
+    ``precomputed://gs://bucket/path``) and the newer ``<kvstore>|<format>:``
+    suffix (e.g. ``https://host/data.ome.zarr|zarr3:``).
     """
-    return url.split("|", 1)[0]
+    if "|" in url:
+        kvstore, fmt = url.rsplit("|", 1)
+        fmt = fmt.rstrip(":")
+    else:
+        fmt, kvstore = url.split("://", 1)
+    if not kvstore.startswith(_KVSTORE_SCHEMES):
+        # A bare path is a local filesystem store.
+        kvstore = "file://" + kvstore
+    return fmt.lower(), kvstore
+
+
+def _read_json_key(kvstore, key):
+    """Read and parse a JSON metadata key from a TensorStore kvstore, or None."""
+    try:
+        store = ts.KvStore.open(kvstore).result()
+        result = store.read(key).result()
+    except Exception:
+        return None
+    if not result.value:
+        return None
+    return json.loads(bytes(result.value))
+
+
+def _resolve_multiscale_kvstore(driver, kvstore, mip):
+    """If ``kvstore`` points at an OME multiscale group, descend to level ``mip``.
+
+    TensorStore opens a single array, not an OME-NGFF multiscale group, so the
+    kvstore path must point at the desired resolution array. Reads the group
+    metadata (``zarr.json`` for v3, ``.zattrs`` for v2) to find the dataset path.
+    Returns ``kvstore`` unchanged when it is not a multiscale group.
+    """
+    base = kvstore.rstrip("/")
+    multiscales = None
+    if driver == "zarr3":
+        meta = _read_json_key(kvstore, "zarr.json")
+        if meta and meta.get("node_type") == "group":
+            attributes = meta.get("attributes", {})
+            ome = attributes.get("ome", attributes)
+            multiscales = ome.get("multiscales")
+    elif driver == "zarr":
+        multiscales = (_read_json_key(kvstore, ".zattrs") or {}).get("multiscales")
+    if multiscales:
+        datasets = multiscales[0]["datasets"]
+        return base + "/" + datasets[int(mip)]["path"]
+    return kvstore
+
+
+def source_url_to_spec(url, mip=0):
+    """Turn a Neuroglancer source URL into a TensorStore open spec.
+
+    Pure (no I/O): selects the driver from the source format and sets
+    ``scale_index`` for precomputed. OME multiscale resolution for zarr is
+    deferred to ``_open_source`` so spec building never does (hangable) network
+    reads.
+    """
+    fmt, kvstore = split_source_url(url)
+    driver = _DRIVER_BY_FORMAT.get(fmt)
+    if driver is None:
+        raise RuntimeError(f"refine: unsupported source format '{fmt}' in '{url}'")
+    spec = {"driver": driver, "kvstore": kvstore}
+    if driver == "neuroglancer_precomputed":
+        spec["scale_index"] = int(mip)
+    return spec
+
+
+def _open_source(url, mip):
+    """Lazily open a Neuroglancer source URL as a TensorStore dataset.
+
+    If a zarr source is an OME multiscale *group* rather than a single array,
+    the first open fails; we then resolve the level-``mip`` dataset path from
+    the group metadata and retry once.
+    """
+    spec = source_url_to_spec(url, mip)
+    try:
+        return ts.open(spec).result()
+    except Exception as exc:
+        if spec["driver"] in ("zarr", "zarr3"):
+            resolved = _resolve_multiscale_kvstore(spec["driver"], spec["kvstore"], mip)
+            if resolved != spec["kvstore"]:
+                return ts.open({**spec, "kvstore": resolved}).result()
+        raise RuntimeError(
+            f"refine: TensorStore could not open source '{url}': {exc}"
+        ) from exc
+
+
+def _spatial_axis_order(labels, rank, ndim):
+    """Return (spatial_axes, nonspatial_axes) for a TensorStore dataset.
+
+    Spatial axes are kept in their native storage order, which matches the
+    column order of the layer transform. Channel/time axes are reduced to their
+    first index. Falls back to the trailing ``ndim`` axes when labels are absent.
+    """
+    named = [i for i, label in enumerate(labels)
+             if label and label.lower() not in _NON_SPATIAL_LABELS]
+    if len(named) == ndim:
+        spatial = named
+    elif rank == ndim:
+        spatial = list(range(rank))
+    else:
+        spatial = list(range(rank - ndim, rank))
+        print("refine: warning - unlabeled source dimensions; assuming the "
+              f"trailing {ndim} axes are spatial.")
+    nonspatial = [i for i in range(rank) if i not in spatial]
+    return spatial, nonspatial
 
 def layer_transform_matrix(layer, ndim):
     """Return the 4x4 local-voxel -> global-voxel affine for a layer source.
@@ -363,32 +484,34 @@ def fetch_layer_image(layer, scale_global, center_global_voxel,
     local_min = np.floor(corners_local.min(axis=0)).astype(int)
     local_max = np.ceil(corners_local.max(axis=0)).astype(int) + 1
 
-    cloudpath = source_url_to_cloudpath(layer.source[0].url)
-    try:
-        vol = CloudVolume(cloudpath, mip=mip, fill_missing=True,
-                          progress=False, use_https=True)
-    except Exception as exc:  # surface a clear, layer-scoped error
-        raise RuntimeError(
-            f"refine: CloudVolume could not open source '{cloudpath}': {exc}"
-        ) from exc
+    dataset = _open_source(layer.source[0].url, mip)  # lazy: no voxel data read yet
 
-    # CloudVolume bounds are in mip-0-equivalent absolute voxel coordinates,
-    # which we treat as the layer's local voxel grid. Clamp the request.
-    bounds = vol.bounds  # Bbox in this mip's voxels
-    lo = np.maximum(local_min, np.array(bounds.minpt[:ndim]))
-    hi = np.minimum(local_max, np.array(bounds.maxpt[:ndim]))
+    # The spatial axes are in the dataset's stored order, which matches the
+    # column order of the layer transform; channel/time axes are dropped.
+    domain = dataset.domain
+    spatial, nonspatial = _spatial_axis_order(list(domain.labels), dataset.rank, ndim)
+
+    # Clamp the requested local-voxel box to the array bounds on each spatial axis.
+    lo = np.maximum(local_min, [int(domain[a].inclusive_min) for a in spatial])
+    hi = np.minimum(local_max, [int(domain[a].exclusive_max) for a in spatial])
     if np.any(hi <= lo):
         raise RuntimeError(
             "refine: requested box does not overlap layer bounds "
-            f"({cloudpath}); check the landmark and box size."
+            f"({layer.source[0].url}); check the landmark and box size."
         )
 
-    cutout = vol[lo[0]:hi[0], lo[1]:hi[1], lo[2]:hi[2]]
-    array_xyz = np.asarray(cutout)[..., 0]  # drop channel -> [x, y, z]
+    # Read ONLY the small cutout into memory (the whole volume stays lazy).
+    index = [slice(None)] * dataset.rank
+    for axis in nonspatial:
+        index[axis] = int(domain[axis].inclusive_min)
+    for k, axis in enumerate(spatial):
+        index[axis] = slice(int(lo[k]), int(hi[k]))
+    array_local = np.asarray(dataset[tuple(index)])  # spatial axes, native order
 
-    # numpy [x, y, z] -> SimpleITK array order [z, y, x] -> Image indexed (x,y,z).
-    array_zyx = np.ascontiguousarray(np.transpose(array_xyz, (2, 1, 0)))
-    image = sitk.GetImageFromArray(array_zyx.astype(np.float32))
+    # numpy [a0, a1, a2] -> SimpleITK array order [a2, a1, a0]; SimpleITK image
+    # index i then corresponds to local spatial axis i (matching the transform).
+    array_rev = np.ascontiguousarray(np.transpose(array_local, tuple(range(ndim - 1, -1, -1))))
+    image = sitk.GetImageFromArray(array_rev.astype(np.float32))
 
     # Geometry: linear_phys maps local voxel -> global physical (= global voxel * scale).
     diag_scale = np.diag(scale_global)

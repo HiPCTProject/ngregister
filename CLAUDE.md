@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ngregister starts a local Neuroglancer instance with custom keyboard shortcuts for manually
 registering (translating, rotating, flipping) one volume layer onto another, plus an automated
-local refinement step that uses CloudVolume + SimpleITK to fine-tune the alignment around a
+local refinement step that uses TensorStore + SimpleITK to fine-tune the alignment around a
 landmark. It is a single script, `ngregister.py`, driven as an interactive Python session.
 
 ## Running
@@ -23,7 +23,7 @@ The script opens a browser tab to the viewer and drops you into the Python REPL 
 it prints the current Neuroglancer URL (via an `atexit` hook) so the registered state can be
 recovered.
 
-Dependencies (`requirements.txt`): `neuroglancer`, `numpy`, `scipy`, plus `cloud-volume` and
+Dependencies (`requirements.txt`): `neuroglancer`, `numpy`, `scipy`, plus `tensorstore` and
 `SimpleITK` for the refinement step. To support newer Neuroglancer source URLs (e.g.
 `gs://bucket/data.ome.zarr|zarr:`), install the dev build:
 `pip install git+https://github.com/google/neuroglancer.git` (needs a `node` + `Python.h` build env).
@@ -59,7 +59,7 @@ block (e.g. `s.input_event_bindings.viewer['keyt'] = 'translate-layer-with-curso
 ## Refinement step
 
 `refine_registration()` (callable from the REPL, defined in the same `ngregister.py`) fetches a small
-subvolume around the landmark from a reference and a moving layer with CloudVolume, runs an affine
+subvolume around the landmark from a reference and a moving layer with TensorStore, runs an affine
 SimpleITK registration, and composes the correction back onto the moving layer via the same
 `apply_transform_to_layer`.
 
@@ -67,12 +67,17 @@ The refinement code is built around explicit affine bookkeeping in one shared fr
 libraries disagree on axis order:
 - Neuroglancer positions are global/output **voxel** coordinates ordered like `viewer.dimensions`; a
   layer's `source[0].transform.matrix` is a 3x4 affine mapping *local voxel -> global voxel*.
-- CloudVolume `vol[x0:x1, y0:y1, z0:z1]` returns numpy `[x, y, z, channel]` (x-first).
+- TensorStore opens the source lazily (precomputed, zarr, sharded zarr3, n5) and only the small
+  cutout is read; the returned array's axes are in the source's stored order (= the transform's
+  column order). `source_url_to_spec` builds the open spec (driver + kvstore + `scale_index`) purely;
+  `_open_source` opens it and, if a zarr source is an OME multiscale *group*, resolves the level path
+  from the metadata on a retry. `_spatial_axis_order` uses TensorStore dimension labels to drop the
+  channel axis and confirm spatial axes (no hardcoded x-first assumption).
 - SimpleITK images are indexed `(x, y, z)` but `Get/SetImageFromArray` use reversed `[z, y, x]`;
   geometry is physical via origin/spacing/direction.
 
-Pipeline (`fetch_layer_image` -> `register_affine` -> compose): each cutout is transposed
-`[x,y,z]->[z,y,x]` for SimpleITK and placed in global **physical** space (= global voxel x
+Pipeline (`fetch_layer_image` -> `register_affine` -> compose): each cutout is reversed
+`[a0,a1,a2]->[a2,a1,a0]` for SimpleITK and placed in global **physical** space (= global voxel x
 `dimensions.scales`, which are SI meters but only ever used as a consistent conversion factor) by
 setting the image origin/spacing/direction from the layer affine (`polar_decompose` splits its
 linear part into an orthonormal direction + per-axis spacing; assumes no shear, which is what
