@@ -95,10 +95,33 @@ def _write_ome_zarr3_group(dirpath, array_xyz, resolution):
     return "zarr3://file://" + str(dirpath) + "/"
 
 
-def _state(scales, landmark, fixed_layer, moving_layer):
+def _write_ome_zarr3_scaled(dirpath, array_xyz, scale, translation, unit="nanometer"):
+    """Write an OME-Zarr v3 multiscale group whose level-0 voxel size is ``scale``.
+
+    Unlike ``_write_ome_zarr3_group`` this records real ``coordinateTransformations``
+    so the source's native resolution differs from the global frame -- the
+    situation that broke the box mapping in issue #5.
+    """
+    dirpath.mkdir(parents=True, exist_ok=True)
+    _write_zarr3_sharded(dirpath / "0", array_xyz, ["x", "y", "z"])
+    group_meta = {
+        "zarr_format": 3, "node_type": "group",
+        "attributes": {"ome": {"multiscales": [{
+            "axes": [{"name": n, "type": "space", "unit": unit}
+                     for n in ["x", "y", "z"]],
+            "datasets": [{"path": "0", "coordinateTransformations": [
+                {"type": "scale", "scale": list(scale)},
+                {"type": "translation", "translation": list(translation)}]}],
+        }]}},
+    }
+    (dirpath / "zarr.json").write_text(json.dumps(group_meta))
+    return "zarr3://file://" + str(dirpath) + "/"
+
+
+def _state(scales, landmark, fixed_layer, moving_layer, units="nm"):
     state = neuroglancer.ViewerState()
     state.dimensions = neuroglancer.CoordinateSpace(
-        names=["x", "y", "z"], units="nm", scales=scales)
+        names=["x", "y", "z"], units=units, scales=scales)
     state.position = landmark
     state.layers.append(name="ref::fix", layer=fixed_layer)
     state.layers.append(name="mov::mov", layer=moving_layer)
@@ -189,6 +212,38 @@ def test_refine_zarr3_reversed_axes(monkeypatch, tmp_path):
 
     correction = ngregister.refine_registration(size_voxels=60, apply=False)
     _assert_cancels_shift(correction, shift)
+
+
+def test_refine_ome_coarse_resolution_recovers_shift(monkeypatch, tmp_path):
+    """Source stored at a coarser resolution than the global frame (issue #5).
+
+    The OME level-0 voxel is 8 nm while the viewer frame is 4 nm, so the layer
+    transform maps the source's *physical* position (in 4 nm voxel units), not
+    the raw array index. The landmark sits where treating the matrix as an
+    index map would clamp the box to nothing and raise "does not overlap"; the
+    fix must instead read the right cutout and recover the shift.
+    """
+    global_scale = [4.0, 4.0, 4.0]                     # nm per global voxel
+    native_scale = [8.0, 8.0, 8.0]                     # nm per source voxel
+    native_translation = [4.0, 4.0, 4.0]               # nm
+    ratio = native_scale[0] / global_scale[0]          # 2 global voxels / source voxel
+    shift_native = np.array([3.0, -2.0, 1.0])          # in source voxels
+    vol = _texture()
+    moving = ndi.shift(vol, shift_native, order=1, mode="reflect")
+
+    fixed_url = _write_ome_zarr3_scaled(
+        tmp_path / "fixed", vol, native_scale, native_translation)
+    moving_url = _write_ome_zarr3_scaled(
+        tmp_path / "moving", moving, native_scale, native_translation)
+    # global voxel near the far edge: index-as-global would fall out of bounds.
+    landmark = [150.0, 150.0, 150.0]
+    state = _state(global_scale, landmark,
+                   _image_layer(fixed_url), _image_layer(moving_url))
+    monkeypatch.setattr(ngregister, "viewer", types.SimpleNamespace(state=state))
+
+    correction = ngregister.refine_registration(size_voxels=60, apply=False)
+    # The shift is reported in global voxels (source voxels x ratio).
+    _assert_cancels_shift(correction, shift_native * ratio)
 
 
 def test_refine_ome_multiscale_group(monkeypatch, tmp_path):

@@ -309,6 +309,22 @@ _DRIVER_BY_FORMAT = {
 _KVSTORE_SCHEMES = ("gs://", "s3://", "http://", "https://", "file://", "memory://")
 # Dimension-label names that are not spatial and are reduced to their first index.
 _NON_SPATIAL_LABELS = {"channel", "c", "t", "time"}
+# Physical length units -> metres, for comparing source and viewer scales.
+_UNIT_TO_METERS = {
+    "m": 1.0, "meter": 1.0, "metre": 1.0,
+    "cm": 1e-2, "centimeter": 1e-2, "centimetre": 1e-2,
+    "mm": 1e-3, "millimeter": 1e-3, "millimetre": 1e-3,
+    "um": 1e-6, "µm": 1e-6, "micrometer": 1e-6, "micrometre": 1e-6, "micron": 1e-6,
+    "nm": 1e-9, "nanometer": 1e-9, "nanometre": 1e-9,
+    "angstrom": 1e-10, "Å": 1e-10,
+}
+
+
+def _unit_to_meters(unit):
+    """Length unit string -> metres; None/empty/unknown -> 1.0 (treat as ratio)."""
+    if not unit:
+        return 1.0
+    return _UNIT_TO_METERS.get(str(unit).strip().lower(), 1.0)
 
 
 def split_source_url(url):
@@ -341,15 +357,12 @@ def _read_json_key(kvstore, key):
     return json.loads(bytes(result.value))
 
 
-def _resolve_multiscale_kvstore(driver, kvstore, mip):
-    """If ``kvstore`` points at an OME multiscale group, descend to level ``mip``.
+def _ome_multiscale(driver, kvstore):
+    """Return the first OME-NGFF ``multiscales`` entry for a zarr group, or None.
 
-    TensorStore opens a single array, not an OME-NGFF multiscale group, so the
-    kvstore path must point at the desired resolution array. Reads the group
-    metadata (``zarr.json`` for v3, ``.zattrs`` for v2) to find the dataset path.
-    Returns ``kvstore`` unchanged when it is not a multiscale group.
+    Reads the group metadata (``zarr.json`` for v3, ``.zattrs`` for v2). Returns
+    None when ``kvstore`` is not an OME multiscale group (e.g. a plain array).
     """
-    base = kvstore.rstrip("/")
     multiscales = None
     if driver == "zarr3":
         meta = _read_json_key(kvstore, "zarr.json")
@@ -359,10 +372,88 @@ def _resolve_multiscale_kvstore(driver, kvstore, mip):
             multiscales = ome.get("multiscales")
     elif driver == "zarr":
         multiscales = (_read_json_key(kvstore, ".zattrs") or {}).get("multiscales")
-    if multiscales:
-        datasets = multiscales[0]["datasets"]
-        return base + "/" + datasets[int(mip)]["path"]
+    else:
+        multiscales = None
+    return multiscales[0] if multiscales else None
+
+
+def _resolve_multiscale_kvstore(driver, kvstore, mip):
+    """If ``kvstore`` points at an OME multiscale group, descend to level ``mip``.
+
+    TensorStore opens a single array, not an OME-NGFF multiscale group, so the
+    kvstore path must point at the desired resolution array. Reads the group
+    metadata to find the dataset path. Returns ``kvstore`` unchanged when it is
+    not a multiscale group.
+    """
+    multiscale = _ome_multiscale(driver, kvstore)
+    if multiscale:
+        datasets = multiscale["datasets"]
+        return kvstore.rstrip("/") + "/" + datasets[int(mip)]["path"]
     return kvstore
+
+
+def _native_voxel_geometry(url, mip, spatial, global_scale_phys):
+    """Per-spatial-axis ``(ratio, offset)`` mapping array index -> intrinsic coord.
+
+    The neuroglancer source ``transform.matrix`` does not map the raw array
+    index to global voxels: it maps the source's *physical* position expressed
+    in global-voxel units (the source's intrinsic coordinate). This converts an
+    array index to that intrinsic coordinate per axis::
+
+        intrinsic = ratio * index + offset
+
+    with ``ratio = native_voxel_size / global_voxel_size`` and
+    ``offset = native_origin / global_voxel_size`` (both in metres / metres, so
+    unitless). Native geometry comes from the OME ``coordinateTransformations``
+    (zarr) or the precomputed ``resolution`` (precomputed). Falls back to
+    ``(1, 0)`` -- index == intrinsic -- when no resolution metadata is found,
+    which preserves behaviour for sources stored at the global resolution.
+
+    ``global_scale_phys`` is the viewer dimensions' physical voxel size in metres
+    (one entry per spatial axis, in the transform's column order).
+    """
+    fmt, kvstore = split_source_url(url)
+    driver = _DRIVER_BY_FORMAT.get(fmt)
+    native_scale_m = None
+    native_trans_m = None
+
+    if driver in ("zarr", "zarr3"):
+        multiscale = _ome_multiscale(driver, kvstore)
+        if multiscale:
+            axes = multiscale.get("axes", [])
+            datasets = multiscale["datasets"]
+            transforms = datasets[min(int(mip), len(datasets) - 1)].get(
+                "coordinateTransformations", [])
+            scale = next((t["scale"] for t in transforms
+                          if t.get("type") == "scale"), None)
+            translation = next((t["translation"] for t in transforms
+                                if t.get("type") == "translation"), None)
+            if scale is not None:
+                factors = [_unit_to_meters(axes[a].get("unit")) if a < len(axes)
+                           else 1.0 for a in spatial]
+                native_scale_m = [scale[a] * f for a, f in zip(spatial, factors)]
+                if translation is not None:
+                    native_trans_m = [translation[a] * f
+                                      for a, f in zip(spatial, factors)]
+    elif driver == "neuroglancer_precomputed":
+        info = _read_json_key(kvstore, "info")
+        scales = (info or {}).get("scales")
+        if scales:
+            resolution = scales[min(int(mip), len(scales) - 1)].get("resolution")
+            if resolution is not None:
+                # precomputed resolutions are in nanometres
+                native_scale_m = [resolution[a] * 1e-9 for a in spatial]
+
+    if native_scale_m is None:
+        return np.ones(len(spatial)), np.zeros(len(spatial))
+
+    global_scale_phys = np.asarray(global_scale_phys, dtype=float)
+    ratio = np.asarray(native_scale_m, dtype=float) / global_scale_phys
+    if native_trans_m is None:
+        offset = np.zeros(len(spatial))
+    else:
+        offset = np.asarray(native_trans_m, dtype=float) / global_scale_phys
+    return ratio, offset
 
 
 def source_url_to_spec(url, mip=0):
@@ -462,27 +553,22 @@ def _global_box_corners(center_global_voxel, half_extent_global_voxel):
     offsets = np.array(np.meshgrid([-1, 1], [-1, 1], [-1, 1])).reshape(3, -1).T
     return center_global_voxel + offsets * half_extent_global_voxel
 
-def fetch_layer_image(layer, scale_global, center_global_voxel,
+def fetch_layer_image(layer, scale_global, global_scale_phys, center_global_voxel,
                       half_extent_global_voxel, mip=0):
     """Fetch a subvolume and return it as a SimpleITK image in global physical space.
 
     The returned image's origin / spacing / direction place every voxel at its
     true global physical position, so two layers fetched this way share the
     same physical frame and start roughly aligned.
+
+    ``scale_global`` is the (normalized) global voxel size used for the
+    SimpleITK physical frame; ``global_scale_phys`` is the global voxel size in
+    metres, used to relate the source's native resolution to the global frame.
     """
     ndim = len(scale_global)
     matrix = layer_transform_matrix(layer, ndim)
-    linear = matrix[:ndim, :ndim]
-    translation = matrix[:ndim, ndim]
-    matrix_inv = np.linalg.inv(matrix)
-
-    # Map the global-voxel box into local voxel coordinates and take the
-    # bounding integer range.
-    corners_global = _global_box_corners(center_global_voxel, half_extent_global_voxel)
-    corners_h = np.hstack([corners_global, np.ones((corners_global.shape[0], 1))])
-    corners_local = (matrix_inv @ corners_h.T).T[:, :ndim]
-    local_min = np.floor(corners_local.min(axis=0)).astype(int)
-    local_max = np.ceil(corners_local.max(axis=0)).astype(int) + 1
+    m_linear = matrix[:ndim, :ndim]
+    m_translation = matrix[:ndim, ndim]
 
     dataset = _open_source(layer.source[0].url, mip)  # lazy: no voxel data read yet
 
@@ -491,7 +577,28 @@ def fetch_layer_image(layer, scale_global, center_global_voxel,
     domain = dataset.domain
     spatial, nonspatial = _spatial_axis_order(list(domain.labels), dataset.rank, ndim)
 
-    # Clamp the requested local-voxel box to the array bounds on each spatial axis.
+    # Array index -> intrinsic coordinate. The layer transform maps the source's
+    # intrinsic (physical, in global-voxel units) coordinate to global voxels,
+    # not the raw array index; this captures sources stored at a resolution
+    # different from the global frame (e.g. a low-res OME-Zarr overview level).
+    ratio, offset = _native_voxel_geometry(
+        layer.source[0].url, mip, spatial, global_scale_phys)
+
+    # Full array-index -> global-voxel affine: global = m @ (ratio * index + offset).
+    linear = m_linear @ np.diag(ratio)
+    translation = m_linear @ offset + m_translation
+    affine_inv = np.linalg.inv(np.block(
+        [[linear, translation[:, None]], [np.zeros((1, ndim)), np.ones((1, 1))]]))
+
+    # Map the global-voxel box into array-index coordinates and take the
+    # bounding integer range.
+    corners_global = _global_box_corners(center_global_voxel, half_extent_global_voxel)
+    corners_h = np.hstack([corners_global, np.ones((corners_global.shape[0], 1))])
+    corners_local = (affine_inv @ corners_h.T).T[:, :ndim]
+    local_min = np.floor(corners_local.min(axis=0)).astype(int)
+    local_max = np.ceil(corners_local.max(axis=0)).astype(int) + 1
+
+    # Clamp the requested array-index box to the array bounds on each spatial axis.
     lo = np.maximum(local_min, [int(domain[a].inclusive_min) for a in spatial])
     hi = np.minimum(local_max, [int(domain[a].exclusive_max) for a in spatial])
     if np.any(hi <= lo):
@@ -661,15 +768,17 @@ def refine_registration(size_voxels=200, fixed=None, moving=None, mip=0, apply=T
     global viewer
     state = viewer.state
     dims = state.dimensions
-    # Per-axis physical size of one global voxel, in the dimensions' order.
-    # dims.scales are SI metres; they are only ever used as a consistent
-    # voxel<->physical conversion factor (any common factor cancels in the
-    # round-trip below), so normalize to the finest axis. This keeps the
-    # anisotropy ratio but gives SimpleITK sane O(1) spacings instead of the
-    # ~1e-9 values that trip ITK's small-spacing guard.
-    scale_global = np.array(dims.scales, dtype=float)
-    scale_global = scale_global / np.min(scale_global)
-    ndim = len(scale_global)
+    # Per-axis physical size of one global voxel (metres), in the dimensions'
+    # order. Used both to relate each source's native resolution to the global
+    # frame (in fetch_layer_image) and, after normalizing to the finest axis,
+    # as the SimpleITK physical frame. Normalizing keeps the anisotropy ratio
+    # but gives SimpleITK sane O(1) spacings instead of the ~1e-9 values that
+    # trip ITK's small-spacing guard (any common factor cancels in the
+    # round-trip below).
+    global_scale_phys = np.array(dims.scales, dtype=float) * np.array(
+        [_unit_to_meters(u) for u in dims.units], dtype=float)
+    scale_global = global_scale_phys / np.min(global_scale_phys)
+    ndim = len(global_scale_phys)
 
     fixed_name, moving_name = resolve_roles(state, fixed=fixed, moving=moving)
     print(f"refine: reference='{fixed_name}'  moving='{moving_name}'")
@@ -680,11 +789,11 @@ def refine_registration(size_voxels=200, fixed=None, moving=None, mip=0, apply=T
     half_extent_global_voxel = size_voxels / 2.0
 
     fixed_image = fetch_layer_image(
-        state.layers[fixed_name].layer, scale_global,
+        state.layers[fixed_name].layer, scale_global, global_scale_phys,
         center_global_voxel, half_extent_global_voxel, mip=mip,
     )
     moving_image = fetch_layer_image(
-        state.layers[moving_name].layer, scale_global,
+        state.layers[moving_name].layer, scale_global, global_scale_phys,
         center_global_voxel, half_extent_global_voxel, mip=mip,
     )
 

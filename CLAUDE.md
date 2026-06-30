@@ -66,7 +66,16 @@ SimpleITK registration, and composes the correction back onto the moving layer v
 The refinement code is built around explicit affine bookkeeping in one shared frame because the three
 libraries disagree on axis order:
 - Neuroglancer positions are global/output **voxel** coordinates ordered like `viewer.dimensions`; a
-  layer's `source[0].transform.matrix` is a 3x4 affine mapping *local voxel -> global voxel*.
+  layer's `source[0].transform.matrix` is a 3x4 affine mapping the source's *intrinsic* coordinate ->
+  global voxel. The intrinsic coordinate is **not** the raw array index: it is the source's physical
+  position expressed in global-voxel units, so the matrix is near-identity even when the source is
+  stored at a different resolution than the global frame. `_native_voxel_geometry` recovers the
+  per-axis `(ratio, offset)` that turns an array index into that intrinsic coordinate from the
+  source's resolution metadata (OME `coordinateTransformations` for zarr via `_ome_multiscale`,
+  precomputed `resolution`); `fetch_layer_image` composes it with the transform into the full
+  array-index -> global-voxel affine used for both the box clamp and the SimpleITK geometry. Without
+  this an OME overview level (e.g. 20 um data in a 4 um frame) maps the box ~5x too far and misses
+  the array bounds (issue #5). Falls back to `(1, 0)` when no resolution metadata is found.
 - TensorStore opens the source lazily (precomputed, zarr, sharded zarr3, n5) and only the small
   cutout is read; the returned array's axes are in the source's stored order (= the transform's
   column order). `source_url_to_spec` builds the open spec (driver + kvstore + `scale_index`) purely;
@@ -78,7 +87,8 @@ libraries disagree on axis order:
 
 Pipeline (`fetch_layer_image` -> `register_affine` -> compose): each cutout is reversed
 `[a0,a1,a2]->[a2,a1,a0]` for SimpleITK and placed in global **physical** space (= global voxel x
-`dimensions.scales`, which are SI meters but only ever used as a consistent conversion factor) by
+`dimensions.scales` converted to metres via `_unit_to_meters`, then normalized to the finest axis so
+ITK sees O(1) spacings; the common factor cancels in the round-trip) by
 setting the image origin/spacing/direction from the layer affine (`polar_decompose` splits its
 linear part into an orthonormal direction + per-axis spacing; assumes no shear, which is what
 ngregister's gestures produce). Both images thus share a frame, so registration starts at identity.
