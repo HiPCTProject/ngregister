@@ -553,8 +553,24 @@ def _global_box_corners(center_global_voxel, half_extent_global_voxel):
     offsets = np.array(np.meshgrid([-1, 1], [-1, 1], [-1, 1])).reshape(3, -1).T
     return center_global_voxel + offsets * half_extent_global_voxel
 
+def layer_shader_window(layer):
+    """The layer's `normalized` shader range [lo, hi], or None if unset.
+
+    This is the intensity window the user tuned in the viewer (the 'normalized'
+    invlerp control). Reusing it for registration normalizes both layers on the
+    same meaningful contrast the user sees, instead of each cutout's raw min/max.
+    """
+    controls = getattr(layer, "shader_controls", None)
+    if not controls:
+        return None
+    normalized = controls.get("normalized")
+    window = getattr(normalized, "range", None)
+    if window is None:
+        return None
+    return float(window[0]), float(window[1])
+
 def fetch_layer_image(layer, scale_global, global_scale_phys, center_global_voxel,
-                      half_extent_global_voxel, mip=0):
+                      half_extent_global_voxel, mip=0, intensity_window=None):
     """Fetch a subvolume and return it as a SimpleITK image in global physical space.
 
     The returned image's origin / spacing / direction place every voxel at its
@@ -630,7 +646,17 @@ def fetch_layer_image(layer, scale_global, global_scale_phys, center_global_voxe
     image.SetDirection([float(v) for v in direction.flatten()])
     image.SetOrigin([float(o) for o in origin])
 
-    image = sitk.Cast(sitk.RescaleIntensity(image, 0.0, 1.0), sitk.sitkFloat32)
+    image = sitk.Cast(image, sitk.sitkFloat32)
+    if intensity_window is not None:
+        # Clip to the user's shader window, then map it to [0, 1]. This fixes the
+        # normalization to the same contrast both layers are displayed with,
+        # rather than each cutout's own (outlier-sensitive) min/max.
+        lo, hi = intensity_window
+        image = sitk.IntensityWindowing(
+            image, windowMinimum=float(lo), windowMaximum=float(hi),
+            outputMinimum=0.0, outputMaximum=1.0)
+    else:
+        image = sitk.RescaleIntensity(image, 0.0, 1.0)
     return image
 
 def _set_metric(registration, metric):
@@ -811,7 +837,7 @@ def landmark_point(state, ndim):
 
 def refine_registration(size_voxels=200, fixed=None, moving=None, mip=0, apply=True,
                         metric="correlation", model="rigid",
-                        fixed_mip=None, moving_mip=None):
+                        fixed_mip=None, moving_mip=None, use_shader_window=True):
     """Refine the moving layer's registration around the landmark.
 
     Callable from the interactive (`python -i`) session. Fetches a cube of
@@ -830,6 +856,11 @@ def refine_registration(size_voxels=200, fixed=None, moving=None, mip=0, apply=T
     and a fine VOI can be compared at whichever levels give a comparable working
     resolution. The physical framing (`_native_voxel_geometry`) adapts to each
     chosen level, so the two cutouts still share a frame regardless of the levels.
+
+    `use_shader_window` normalizes each cutout by the layer's viewer shader window
+    (the 'normalized' invlerp range) instead of its raw min/max, so both layers
+    use the same meaningful contrast; falls back to min/max when a layer has no
+    shader window. Set False to force min/max normalization.
 
     Returns the 4x4 global-voxel correction matrix that was applied.
     """
@@ -859,13 +890,20 @@ def refine_registration(size_voxels=200, fixed=None, moving=None, mip=0, apply=T
     size_voxels = np.broadcast_to(np.asarray(size_voxels, dtype=float), (ndim,))
     half_extent_global_voxel = size_voxels / 2.0
 
+    fixed_layer = state.layers[fixed_name].layer
+    moving_layer = state.layers[moving_name].layer
+    fixed_window = layer_shader_window(fixed_layer) if use_shader_window else None
+    moving_window = layer_shader_window(moving_layer) if use_shader_window else None
+
     fixed_image = fetch_layer_image(
-        state.layers[fixed_name].layer, scale_global, global_scale_phys,
+        fixed_layer, scale_global, global_scale_phys,
         center_global_voxel, half_extent_global_voxel, mip=fixed_mip,
+        intensity_window=fixed_window,
     )
     moving_image = fetch_layer_image(
-        state.layers[moving_name].layer, scale_global, global_scale_phys,
+        moving_layer, scale_global, global_scale_phys,
         center_global_voxel, half_extent_global_voxel, mip=moving_mip,
+        intensity_window=moving_window,
     )
 
     transform = register_pair(fixed_image, moving_image, metric=metric, model=model)

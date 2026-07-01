@@ -332,6 +332,35 @@ def test_split_source_url_handles_both_encodings():
     assert ngregister.split_source_url("precomputed:///data/vol")[1] == "file:///data/vol"
 
 
+def test_layer_shader_window_reads_range():
+    layer = neuroglancer.ImageLayer(
+        source="precomputed://x",
+        shader_controls={"normalized": {"range": [7808, 8562]}})
+    assert ngregister.layer_shader_window(layer) == (7808.0, 8562.0)
+    # No shader controls -> None (caller falls back to min/max).
+    assert ngregister.layer_shader_window(
+        neuroglancer.ImageLayer(source="precomputed://x")) is None
+
+
+def test_refine_shader_window_normalization_recovers_shift(monkeypatch, tmp_path):
+    # The shader window path (IntensityWindowing) must still recover a shift; here
+    # the window spans the texture's [0, 60000] u16 range so it is near-lossless.
+    scales = [4, 4, 4]
+    shift = np.array([3.0, -2.0, 1.0])
+    vol = _texture()
+    moving = ndi.shift(vol, shift, order=1, mode="reflect")
+    fixed_url = _write_precomputed(tmp_path / "fixed", vol, scales)
+    moving_url = _write_precomputed(tmp_path / "moving", moving, scales)
+    window = {"normalized": {"range": [0, 60000]}}
+    state = _state(scales, [50, 50, 50],
+                   neuroglancer.ImageLayer(source=fixed_url, shader_controls=window),
+                   neuroglancer.ImageLayer(source=moving_url, shader_controls=window))
+    monkeypatch.setattr(ngregister, "viewer", types.SimpleNamespace(state=state))
+
+    correction = ngregister.refine_registration(size_voxels=60, apply=False)
+    _assert_cancels_shift(correction, shift)
+
+
 def test_source_url_to_spec_selects_driver_and_scale():
     spec = ngregister.source_url_to_spec("precomputed://gs://b/p", mip=2)
     assert spec == {"driver": "neuroglancer_precomputed",

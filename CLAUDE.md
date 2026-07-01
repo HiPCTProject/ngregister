@@ -72,7 +72,11 @@ affine does. `mip` selects the multiscale level fetched from each source (0 = fu
 at whichever levels give a comparable working resolution. Level selection flows through `_open_source`
 (resolves the OME group's level path) and `_native_voxel_geometry` (reads that level's
 `coordinateTransformations`), so each cutout is framed for its own level and the two still share a
-frame regardless of the levels chosen.
+frame regardless of the levels chosen. `use_shader_window` (default on) normalizes each cutout with
+the layer's viewer shader window (`layer_shader_window` reads `shader_controls['normalized'].range`,
+applied via `sitk.IntensityWindowing`) instead of the cutout's raw min/max, falling back to min/max
+when a layer has no window; this matters most for Mattes MI (histogram binning depends on the range)
+since correlation is invariant to a linear intensity rescale.
 
 The refinement code is built around explicit affine bookkeeping in one shared frame because the three
 libraries disagree on axis order:
