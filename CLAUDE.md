@@ -118,6 +118,15 @@ to global-voxel units. `refine_registration` reports the correction as the actua
 induces at the landmark and over the box corners — not the homogeneous translation column, which is
 large for a rotation about a far-from-origin center even when the box barely moves.
 
+A `guard` (default on) then decides whether to apply the result. Because the optimized metric can be
+nudged down by fitting noise on a featureless box, the guard judges *real* alignment with an
+independent measure — `overlap_correlation` resamples moving onto the fixed grid through `T` and takes
+the Pearson correlation over the covered region — and rejects (returns identity, applies nothing) when
+it stays below `min_correlation` (default 0.1) or when the box displacement exceeds `max_shift_voxels`
+(default a quarter of the smallest box side). This is what stops a landmark box lacking structure
+shared by both layers (e.g. a 20 um overview vs a 4.257 um VOI, which barely correlate) from wandering
+off the good manual alignment; `guard=False` applies the raw result.
+
 Layer roles come from name prefixes: `mark-layer-moving` / `mark-layer-reference` (keys
 `alt+m` / `alt+r`) rename the active layer with a `mov::` / `ref::` prefix (constants
 `MOVING_PREFIX` / `REFERENCE_PREFIX`). `resolve_roles` reads those prefixes, else falls back

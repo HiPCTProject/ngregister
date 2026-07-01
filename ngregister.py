@@ -766,6 +766,34 @@ def register_pair(fixed_image, moving_image, metric="correlation", model="rigid"
 
     return sitk.Transform(transform)
 
+def overlap_correlation(fixed_image, moving_image, transform):
+    """Normalized cross-correlation of the two images on their overlap.
+
+    Resamples `moving` onto the fixed grid through `transform` (fixed->moving
+    physical) and returns the Pearson correlation over the region the moving
+    image actually covers. Unlike the optimized metric -- which the optimizer can
+    nudge down by fitting noise even when nothing lines up -- this is a bounded,
+    interpretable [-1, 1] measure of real shared structure, so the guard uses it
+    to tell a genuine match from wandering on a featureless box.
+    """
+    resampled = sitk.Resample(
+        moving_image, fixed_image, transform, sitk.sitkLinear, 0.0, sitk.sitkFloat32)
+    ones = sitk.GetImageFromArray(
+        np.ones(sitk.GetArrayViewFromImage(moving_image).shape, dtype=np.float32))
+    ones.CopyInformation(moving_image)
+    covered = sitk.Resample(
+        ones, fixed_image, transform, sitk.sitkNearestNeighbor, 0.0, sitk.sitkFloat32)
+
+    fixed = sitk.GetArrayViewFromImage(fixed_image).ravel()
+    moving = sitk.GetArrayViewFromImage(resampled).ravel()
+    mask = sitk.GetArrayViewFromImage(covered).ravel() > 0.5
+    if mask.sum() < 2:
+        return 0.0
+    a, b = fixed[mask], moving[mask]
+    if a.std() == 0 or b.std() == 0:
+        return 0.0
+    return float(np.corrcoef(a, b)[0, 1])
+
 def transform_to_matrix(transform, ndim):
     """Convert a SimpleITK affine transform to a 4x4 numpy matrix.
 
@@ -837,7 +865,8 @@ def landmark_point(state, ndim):
 
 def refine_registration(size_voxels=200, fixed=None, moving=None, mip=0, apply=True,
                         metric="correlation", model="rigid",
-                        fixed_mip=None, moving_mip=None, use_shader_window=True):
+                        fixed_mip=None, moving_mip=None, use_shader_window=True,
+                        guard=True, max_shift_voxels=None, min_correlation=0.1):
     """Refine the moving layer's registration around the landmark.
 
     Callable from the interactive (`python -i`) session. Fetches a cube of
@@ -862,7 +891,16 @@ def refine_registration(size_voxels=200, fixed=None, moving=None, mip=0, apply=T
     use the same meaningful contrast; falls back to min/max when a layer has no
     shader window. Set False to force min/max normalization.
 
-    Returns the 4x4 global-voxel correction matrix that was applied.
+    `guard` (default on) rejects a result whose overlap cross-correlation stays
+    below `min_correlation` (default 0.1 -- essentially no shared structure) or
+    that moves the box by more than `max_shift_voxels` (default a quarter of the
+    smallest box side). On a featureless landmark box the optimized metric can
+    still be nudged down by fitting noise, so the guard judges real alignment with
+    an independent cross-correlation and applies nothing rather than wandering off
+    the (already-good) manual alignment. Set False to always apply the raw result.
+
+    Returns the 4x4 global-voxel correction matrix that was applied (identity if
+    the guard rejected the result).
     """
     global viewer
     state = viewer.state
@@ -930,6 +968,28 @@ def refine_registration(size_voxels=200, fixed=None, moving=None, mip=0, apply=T
     probes_h = np.hstack([probes, np.ones((probes.shape[0], 1))])
     moved = (c_vox @ probes_h.T).T[:, :ndim]
     disp = np.linalg.norm(moved - probes, axis=1)
+
+    if guard:
+        # Judge real alignment with an independent cross-correlation: the
+        # optimized metric can be nudged down by fitting noise on a featureless
+        # box, but genuine shared structure shows up as overlap correlation.
+        correlation = overlap_correlation(fixed_image, moving_image, transform)
+        limit = (float(np.min(size_voxels)) / 4.0 if max_shift_voxels is None
+                 else float(max_shift_voxels))
+        reason = None
+        if not np.isfinite(correlation) or abs(correlation) < min_correlation:
+            reason = (f"overlap correlation {correlation:.3g} < {min_correlation:g}; "
+                      "the box lacks structure shared by both layers")
+        elif disp.max() > limit:
+            reason = (f"correction moves the box {disp.max():.3g} voxels, over the "
+                      f"{limit:.3g}-voxel guard limit")
+        if reason is not None:
+            print(f"refine: rejected correction -- {reason}. "
+                  "Nothing applied (pass guard=False, lower min_correlation, or "
+                  "raise max_shift_voxels to override).")
+            return np.eye(ndim + 1)
+        print(f"refine: overlap correlation {correlation:.3g}")
+
     print(f"refine: applying correction (landmark moves {disp[-1]:.3g} voxels, "
           f"max over box {disp.max():.3g} voxels)")
 

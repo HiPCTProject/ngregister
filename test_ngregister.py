@@ -271,6 +271,39 @@ def test_refine_ome_coarse_resolution_recovers_shift(monkeypatch, tmp_path):
     _assert_cancels_shift(correction, shift_native * ratio)
 
 
+def test_refine_guard_rejects_uncorrelated_box(monkeypatch, tmp_path):
+    # Two independent textures share no structure: the guard must reject the
+    # result (return identity, apply nothing) instead of wandering.
+    scales = [4, 4, 4]
+    fixed_url = _write_precomputed(tmp_path / "fixed", _texture(seed=1), scales)
+    moving_url = _write_precomputed(tmp_path / "moving", _texture(seed=2), scales)
+    state = _state(scales, [50, 50, 50],
+                   _image_layer(fixed_url), _image_layer(moving_url))
+    monkeypatch.setattr(ngregister, "viewer", types.SimpleNamespace(state=state))
+
+    correction = ngregister.refine_registration(size_voxels=60, apply=False)
+    assert np.allclose(correction, np.eye(4))          # rejected -> identity
+    # With the guard off, the raw (spurious) result is returned instead.
+    raw = ngregister.refine_registration(size_voxels=60, apply=False, guard=False)
+    assert not np.allclose(raw, np.eye(4))
+
+
+def test_refine_guard_accepts_real_shift(monkeypatch, tmp_path):
+    # A genuine shift of shared structure clears the guard and is recovered.
+    scales = [4, 4, 4]
+    shift = np.array([3.0, -2.0, 1.0])
+    vol = _texture()
+    moving = ndi.shift(vol, shift, order=1, mode="reflect")
+    fixed_url = _write_precomputed(tmp_path / "fixed", vol, scales)
+    moving_url = _write_precomputed(tmp_path / "moving", moving, scales)
+    state = _state(scales, [50, 50, 50],
+                   _image_layer(fixed_url), _image_layer(moving_url))
+    monkeypatch.setattr(ngregister, "viewer", types.SimpleNamespace(state=state))
+
+    correction = ngregister.refine_registration(size_voxels=60, apply=False)
+    _assert_cancels_shift(correction, shift)           # accepted and correct
+
+
 def test_refine_ome_multiscale_group(monkeypatch, tmp_path):
     scales = [4, 4, 8]
     shift = np.array([2.0, -1.0, 1.0])
