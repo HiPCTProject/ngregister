@@ -59,9 +59,15 @@ block (e.g. `s.input_event_bindings.viewer['keyt'] = 'translate-layer-with-curso
 ## Refinement step
 
 `refine_registration()` (callable from the REPL, defined in the same `ngregister.py`) fetches a small
-subvolume around the landmark from a reference and a moving layer with TensorStore, runs an affine
-SimpleITK registration, and composes the correction back onto the moving layer via the same
-`apply_transform_to_layer`.
+subvolume around the landmark from a reference and a moving layer with TensorStore, runs a SimpleITK
+registration, and composes the correction back onto the moving layer via the same
+`apply_transform_to_layer`. Two parameters tune it: `metric` ('correlation' default, 'meansquares',
+or 'mattes') and `model` ('rigid' default, 'similarity', or 'affine'). The defaults suit two scans of
+the *same* specimen at different resolutions (the common case): correlation/meansquares give a far
+stronger gradient than Mattes MI on a small, blurry overview box (MI is for cross-modal pairs and is
+near-flat here), and the rigid/similarity models cannot represent shear, so the optimizer cannot
+spend ill-constrained linear DOF on spurious shear/anisotropic scale the way an unconstrained 12-DOF
+affine does.
 
 The refinement code is built around explicit affine bookkeeping in one shared frame because the three
 libraries disagree on axis order:
@@ -85,17 +91,23 @@ libraries disagree on axis order:
 - SimpleITK images are indexed `(x, y, z)` but `Get/SetImageFromArray` use reversed `[z, y, x]`;
   geometry is physical via origin/spacing/direction.
 
-Pipeline (`fetch_layer_image` -> `register_affine` -> compose): each cutout is reversed
+Pipeline (`fetch_layer_image` -> `register_pair` -> compose): each cutout is reversed
 `[a0,a1,a2]->[a2,a1,a0]` for SimpleITK and placed in global **physical** space (= global voxel x
 `dimensions.scales` converted to metres via `_unit_to_meters`, then normalized to the finest axis so
 ITK sees O(1) spacings; the common factor cancels in the round-trip) by
 setting the image origin/spacing/direction from the layer affine (`polar_decompose` splits its
 linear part into an orthonormal direction + per-axis spacing; assumes no shear, which is what
 ngregister's gestures produce). Both images thus share a frame, so registration starts at identity.
-`register_affine` is staged (translation, then affine) with a gentle `[2,1]` pyramid and a
-RegularStepGradientDescent optimizer — an aggressive pyramid or a from-scratch 12-DOF affine
-diverges on small subvolumes. The SimpleITK transform `T` maps fixed->moving physical points; the
-correction applied to the moving layer is `inv(T)`, converted back to global-voxel units.
+`register_pair` is staged (translation, then the chosen `model` via `_model_transform`) with a gentle
+`[2,1]` pyramid and a RegularStepGradientDescent optimizer — an aggressive pyramid or a from-scratch
+12-DOF affine diverges on small subvolumes. The second-stage transform is **centered on the image**
+(`TransformContinuousIndexToPhysicalPoint` of the size midpoint): the cutout sits thousands of voxels
+from the physical origin, so a transform centered at 0 would make `SetOptimizerScalesFromPhysicalShift`
+freeze the linear DOF and only the translation would move. The SimpleITK transform `T` maps
+fixed->moving physical points; the correction applied to the moving layer is `inv(T)`, converted back
+to global-voxel units. `refine_registration` reports the correction as the actual displacement it
+induces at the landmark and over the box corners — not the homogeneous translation column, which is
+large for a rotation about a far-from-origin center even when the box barely moves.
 
 Layer roles come from name prefixes: `mark-layer-moving` / `mark-layer-reference` (keys
 `alt+m` / `alt+r`) rename the active layer with a `mov::` / `ref::` prefix (constants

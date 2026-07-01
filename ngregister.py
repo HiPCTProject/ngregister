@@ -633,17 +633,38 @@ def fetch_layer_image(layer, scale_global, global_scale_phys, center_global_voxe
     image = sitk.Cast(sitk.RescaleIntensity(image, 0.0, 1.0), sitk.sitkFloat32)
     return image
 
-def _registration_method(transform):
+def _set_metric(registration, metric):
+    """Configure the similarity metric on a registration method.
+
+    'correlation' (default) and 'meansquares' suit same-modality data (the
+    common case here: two scans of the same specimen at different resolutions)
+    and give a far stronger gradient on a small, blurry overview box than mutual
+    information, which is meant for cross-modal registration and is near-flat
+    here. 'mattes'/'mi' remains available for genuinely multi-modal pairs.
+    """
+    name = str(metric).lower()
+    if name in ("correlation", "cc", "ncc"):
+        registration.SetMetricAsCorrelation()
+    elif name in ("meansquares", "ms", "msq"):
+        registration.SetMetricAsMeanSquares()
+    elif name in ("mattes", "mi", "mutualinformation"):
+        registration.SetMetricAsMattesMutualInformation(numberOfHistogramBins=32)
+    else:
+        raise ValueError(
+            f"refine: unknown metric '{metric}' "
+            "(use 'correlation', 'meansquares', or 'mattes')")
+
+def _registration_method(transform, metric="correlation"):
     """A SimpleITK registration configured for local refinement.
 
-    Mattes MI (works across modalities), full-box sampling, and a
+    The chosen metric (see `_set_metric`), full-box sampling, and a
     RegularStepGradientDescent optimizer with physical-shift scaling -- this
     combination is stable from a near-aligned start. The pyramid is kept gentle
     ([2, 1]); an aggressive coarse level blurs small subvolumes enough to
     diverge.
     """
     registration = sitk.ImageRegistrationMethod()
-    registration.SetMetricAsMattesMutualInformation(numberOfHistogramBins=32)
+    _set_metric(registration, metric)
     registration.SetMetricSamplingStrategy(registration.NONE)
     registration.SetInterpolator(sitk.sitkLinear)
     registration.SetOptimizerAsRegularStepGradientDescent(
@@ -662,28 +683,62 @@ def _registration_method(transform):
     registration.SetInitialTransform(transform, inPlace=True)
     return registration
 
-def register_affine(fixed_image, moving_image):
-    """Affine-register `moving` to `fixed` in their shared physical space.
+def _model_transform(model, ndim, center):
+    """Build the second-stage transform for the requested DOF model.
+
+    'rigid' (default, 6 DOF) and 'similarity' (7 DOF, adds one isotropic scale)
+    cannot represent shear, so they are the right constraint for two scans of
+    the same specimen: an unconstrained 12-DOF 'affine' has nine linear DOF that
+    a small, low-contrast box does not pin down, and the optimizer spends them on
+    spurious shear/anisotropic scale instead of the true rigid motion. 'affine'
+    remains available for genuinely non-rigid cases. Euler3D/Similarity3D are
+    3D-only; 'affine' is the fallback for other dimensions.
+    """
+    name = str(model).lower()
+    if name == "rigid" and ndim == 3:
+        transform = sitk.Euler3DTransform()
+    elif name == "similarity" and ndim == 3:
+        transform = sitk.Similarity3DTransform()
+    elif name == "affine":
+        transform = sitk.AffineTransform(ndim)
+    elif name in ("rigid", "similarity"):
+        raise ValueError(f"refine: model '{model}' requires 3D data (got {ndim}D)")
+    else:
+        raise ValueError(
+            f"refine: unknown model '{model}' "
+            "(use 'rigid', 'similarity', or 'affine')")
+    transform.SetCenter(center)
+    return transform
+
+def register_pair(fixed_image, moving_image, metric="correlation", model="rigid"):
+    """Register `moving` to `fixed` in their shared physical space.
 
     Returns the SimpleITK transform T mapping fixed physical points to moving
     physical points. The images already share a physical frame (both are
     fetched into global physical space), so the transform starts at identity.
 
-    Registration is staged: a translation pass first, then a full affine
-    initialized from it. A 12-DOF affine optimized from scratch tends to misuse
-    its extra degrees of freedom (spurious rotation/shear) on what is mostly a
-    residual shift; the staged form converges far more reliably.
+    Registration is staged: a translation pass first, then the chosen `model`
+    initialized from it. A from-scratch 12-DOF affine tends to misuse its extra
+    degrees of freedom (spurious rotation/shear) on what is mostly a residual
+    shift; staging, plus constraining `model` to 'rigid'/'similarity', converges
+    far more reliably. The model is centered on the data: the cutout sits at
+    large physical coordinates (its array-index origin is thousands of voxels
+    from 0), so a transform centered at (0,0,0) would map tiny linear-parameter
+    changes to huge point shifts, and SetOptimizerScalesFromPhysicalShift would
+    then freeze the linear DOF so only the translation moves.
     """
     ndim = fixed_image.GetDimension()
 
     translation = sitk.TranslationTransform(ndim)
-    _registration_method(translation).Execute(fixed_image, moving_image)
+    _registration_method(translation, metric).Execute(fixed_image, moving_image)
 
-    affine = sitk.AffineTransform(ndim)
-    affine.SetTranslation(translation.GetOffset())
-    _registration_method(affine).Execute(fixed_image, moving_image)
+    center = fixed_image.TransformContinuousIndexToPhysicalPoint(
+        [(sz - 1) / 2.0 for sz in fixed_image.GetSize()])
+    transform = _model_transform(model, ndim, center)
+    transform.SetTranslation(translation.GetOffset())
+    _registration_method(transform, metric).Execute(fixed_image, moving_image)
 
-    return sitk.Transform(affine)
+    return sitk.Transform(transform)
 
 def transform_to_matrix(transform, ndim):
     """Convert a SimpleITK affine transform to a 4x4 numpy matrix.
@@ -754,14 +809,20 @@ def landmark_point(state, ndim):
             return np.array(annotations[0].point, dtype=float)
     return np.array(state.voxel_coordinates, dtype=float)
 
-def refine_registration(size_voxels=200, fixed=None, moving=None, mip=0, apply=True):
+def refine_registration(size_voxels=200, fixed=None, moving=None, mip=0, apply=True,
+                        metric="correlation", model="rigid"):
     """Refine the moving layer's registration around the landmark.
 
     Callable from the interactive (`python -i`) session. Fetches a cube of
     `size_voxels` global voxels (scalar, or per-axis in viewer.dimensions order)
-    centered on the landmark from both the reference and moving layers, runs an
-    affine SimpleITK registration, and (if `apply`) composes the correction onto
-    the moving layer's transform via apply_transform_to_layer.
+    centered on the landmark from both the reference and moving layers, runs a
+    SimpleITK registration, and (if `apply`) composes the correction onto the
+    moving layer's transform via apply_transform_to_layer.
+
+    `metric` selects the similarity measure ('correlation', 'meansquares', or
+    'mattes'); `model` constrains the degrees of freedom ('rigid', 'similarity',
+    or 'affine'). The defaults (correlation + rigid) suit same-specimen scans and
+    avoid the spurious shear an unconstrained affine produces on a small box.
 
     Returns the 4x4 global-voxel correction matrix that was applied.
     """
@@ -797,7 +858,7 @@ def refine_registration(size_voxels=200, fixed=None, moving=None, mip=0, apply=T
         center_global_voxel, half_extent_global_voxel, mip=mip,
     )
 
-    transform = register_affine(fixed_image, moving_image)
+    transform = register_pair(fixed_image, moving_image, metric=metric, model=model)
 
     # T maps fixed physical -> moving physical. The spatial correction to apply
     # to the moving layer is C = T^-1 (move the moving feature now at T(p) to p).
@@ -811,8 +872,18 @@ def refine_registration(size_voxels=200, fixed=None, moving=None, mip=0, apply=T
     c_vox[:ndim, :ndim] = diag_scale_inv @ c_phys[:ndim, :ndim] @ diag_scale
     c_vox[:ndim, ndim] = diag_scale_inv @ c_phys[:ndim, ndim]
 
-    shift_voxels = np.linalg.norm(c_vox[:ndim, ndim])
-    print(f"refine: applying correction (translation {shift_voxels:.3g} voxels)")
+    # Report the actual displacement the correction induces over the box, not
+    # the homogeneous translation column: for a rotation about a point far from
+    # the origin that column is large even when the box barely moves, which is
+    # misleading. Sample the landmark and the box corners.
+    probes = np.vstack([
+        _global_box_corners(center_global_voxel, half_extent_global_voxel),
+        center_global_voxel])
+    probes_h = np.hstack([probes, np.ones((probes.shape[0], 1))])
+    moved = (c_vox @ probes_h.T).T[:, :ndim]
+    disp = np.linalg.norm(moved - probes, axis=1)
+    print(f"refine: applying correction (landmark moves {disp[-1]:.3g} voxels, "
+          f"max over box {disp.max():.3g} voxels)")
 
     if apply:
         apply_transform_to_layer(c_vox, chain_backwards=False, layer_name=moving_name)

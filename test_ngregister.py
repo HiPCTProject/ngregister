@@ -304,3 +304,94 @@ def test_resolve_roles_two_layer_fallback():
             name=name, layer=neuroglancer.ImageLayer(source="precomputed://x"))
     state.selectedLayer.layer = "b"
     assert ngregister.resolve_roles(state) == ("a", "b")
+
+
+def test_polar_decompose_rotation_and_scale_is_exact(capsys):
+    # A rotation composed with anisotropic scaling (no shear) -- what
+    # ngregister's rigid + flip gestures produce. The decomposition is exact and
+    # emits no shear warning.
+    angle = np.deg2rad(20.0)
+    rotation = np.array([
+        [np.cos(angle), -np.sin(angle), 0.0],
+        [np.sin(angle), np.cos(angle), 0.0],
+        [0.0, 0.0, 1.0],
+    ])
+    scale = np.diag([2.0, 3.0, 0.5])
+    linear = rotation @ scale
+
+    u, spacing = ngregister.polar_decompose(linear)
+
+    np.testing.assert_allclose(spacing, [2.0, 3.0, 0.5], atol=1e-9)
+    np.testing.assert_allclose(u @ u.T, np.eye(3), atol=1e-9)
+    np.testing.assert_allclose(u @ np.diag(spacing), linear, atol=1e-9)
+    assert "shear" not in capsys.readouterr().out
+
+
+def test_polar_decompose_flip_no_warning(capsys):
+    # A flip (negative determinant) is still a rotation + scale, no shear.
+    linear = np.diag([-1.0, 1.0, 1.0])
+    u, spacing = ngregister.polar_decompose(linear)
+    np.testing.assert_allclose(spacing, [1.0, 1.0, 1.0], atol=1e-9)
+    np.testing.assert_allclose(u @ np.diag(spacing), linear, atol=1e-9)
+    assert "shear" not in capsys.readouterr().out
+
+
+def test_polar_decompose_shear_warns(capsys):
+    # A sheared transform cannot be written as rotation + per-axis scale; the
+    # axis-aligned approximation is used and a warning is reported.
+    linear = np.array([
+        [1.0, 0.5, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.0, 0.0, 1.0],
+    ])
+    u, spacing = ngregister.polar_decompose(linear)
+    assert np.all(spacing > 0)
+    assert "shear" in capsys.readouterr().out
+
+
+def test_set_metric_selects_and_rejects():
+    import SimpleITK as sitk
+    for name in ["correlation", "meansquares", "mattes", "CC", "MS", "MI"]:
+        ngregister._set_metric(sitk.ImageRegistrationMethod(), name)  # no raise
+    try:
+        ngregister._set_metric(sitk.ImageRegistrationMethod(), "bogus")
+    except ValueError as exc:
+        assert "unknown metric" in str(exc)
+    else:
+        raise AssertionError("expected ValueError for unknown metric")
+
+
+def test_model_transform_constrains_dof():
+    import SimpleITK as sitk
+    center = [1.0, 2.0, 3.0]
+    rigid = ngregister._model_transform("rigid", 3, center)
+    assert isinstance(rigid, sitk.Euler3DTransform)
+    assert list(rigid.GetCenter()) == center
+    assert isinstance(ngregister._model_transform("similarity", 3, center),
+                      sitk.Similarity3DTransform)
+    assert isinstance(ngregister._model_transform("affine", 3, center),
+                      sitk.AffineTransform)
+    # rigid/similarity are 3D-only; non-3D must raise rather than silently differ.
+    try:
+        ngregister._model_transform("rigid", 2, [0.0, 0.0])
+    except ValueError as exc:
+        assert "requires 3D" in str(exc)
+    else:
+        raise AssertionError("expected ValueError for 2D rigid")
+    try:
+        ngregister._model_transform("bogus", 3, center)
+    except ValueError as exc:
+        assert "unknown model" in str(exc)
+    else:
+        raise AssertionError("expected ValueError for unknown model")
+
+
+def test_polar_decompose_non_positive_spacing_raises():
+    # A degenerate (rank-deficient) linear map yields a zero spacing.
+    linear = np.diag([1.0, 1.0, 0.0])
+    try:
+        ngregister.polar_decompose(linear)
+    except ValueError as exc:
+        assert "non-positive voxel spacing" in str(exc)
+    else:
+        raise AssertionError("expected ValueError for non-positive spacing")
