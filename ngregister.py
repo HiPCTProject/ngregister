@@ -810,7 +810,8 @@ def landmark_point(state, ndim):
     return np.array(state.voxel_coordinates, dtype=float)
 
 def refine_registration(size_voxels=200, fixed=None, moving=None, mip=0, apply=True,
-                        metric="correlation", model="rigid"):
+                        metric="correlation", model="rigid",
+                        fixed_mip=None, moving_mip=None):
     """Refine the moving layer's registration around the landmark.
 
     Callable from the interactive (`python -i`) session. Fetches a cube of
@@ -823,6 +824,12 @@ def refine_registration(size_voxels=200, fixed=None, moving=None, mip=0, apply=T
     'mattes'); `model` constrains the degrees of freedom ('rigid', 'similarity',
     or 'affine'). The defaults (correlation + rigid) suit same-specimen scans and
     avoid the spurious shear an unconstrained affine produces on a small box.
+
+    `mip` picks the multiscale level (0 = full resolution) fetched from each
+    source; `fixed_mip` / `moving_mip` override it per layer, so a coarse overview
+    and a fine VOI can be compared at whichever levels give a comparable working
+    resolution. The physical framing (`_native_voxel_geometry`) adapts to each
+    chosen level, so the two cutouts still share a frame regardless of the levels.
 
     Returns the 4x4 global-voxel correction matrix that was applied.
     """
@@ -842,7 +849,10 @@ def refine_registration(size_voxels=200, fixed=None, moving=None, mip=0, apply=T
     ndim = len(global_scale_phys)
 
     fixed_name, moving_name = resolve_roles(state, fixed=fixed, moving=moving)
-    print(f"refine: reference='{fixed_name}'  moving='{moving_name}'")
+    fixed_mip = mip if fixed_mip is None else int(fixed_mip)
+    moving_mip = mip if moving_mip is None else int(moving_mip)
+    print(f"refine: reference='{fixed_name}' (mip {fixed_mip})  "
+          f"moving='{moving_name}' (mip {moving_mip})")
 
     center_global_voxel = landmark_point(state, ndim)
 
@@ -851,11 +861,11 @@ def refine_registration(size_voxels=200, fixed=None, moving=None, mip=0, apply=T
 
     fixed_image = fetch_layer_image(
         state.layers[fixed_name].layer, scale_global, global_scale_phys,
-        center_global_voxel, half_extent_global_voxel, mip=mip,
+        center_global_voxel, half_extent_global_voxel, mip=fixed_mip,
     )
     moving_image = fetch_layer_image(
         state.layers[moving_name].layer, scale_global, global_scale_phys,
-        center_global_voxel, half_extent_global_voxel, mip=mip,
+        center_global_voxel, half_extent_global_voxel, mip=moving_mip,
     )
 
     transform = register_pair(fixed_image, moving_image, metric=metric, model=model)

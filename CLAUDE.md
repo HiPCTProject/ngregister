@@ -67,7 +67,12 @@ the *same* specimen at different resolutions (the common case): correlation/mean
 stronger gradient than Mattes MI on a small, blurry overview box (MI is for cross-modal pairs and is
 near-flat here), and the rigid/similarity models cannot represent shear, so the optimizer cannot
 spend ill-constrained linear DOF on spurious shear/anisotropic scale the way an unconstrained 12-DOF
-affine does.
+affine does. `mip` selects the multiscale level fetched from each source (0 = full resolution);
+`fixed_mip` / `moving_mip` override it per layer, so a coarse overview and a fine VOI can be compared
+at whichever levels give a comparable working resolution. Level selection flows through `_open_source`
+(resolves the OME group's level path) and `_native_voxel_geometry` (reads that level's
+`coordinateTransformations`), so each cutout is framed for its own level and the two still share a
+frame regardless of the levels chosen.
 
 The refinement code is built around explicit affine bookkeeping in one shared frame because the three
 libraries disagree on axis order:

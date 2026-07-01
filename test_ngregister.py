@@ -118,6 +118,31 @@ def _write_ome_zarr3_scaled(dirpath, array_xyz, scale, translation, unit="nanome
     return "zarr3://file://" + str(dirpath) + "/"
 
 
+def _write_ome_zarr3_levels(dirpath, arrays, scales, unit="nanometer"):
+    """Write a multi-level OME-Zarr v3 group; return URL.
+
+    ``arrays[i]`` is the level-i volume (stored [x, y, z]) and ``scales[i]`` its
+    per-axis voxel size. Lets a test fetch a chosen level via the ``mip`` /
+    ``fixed_mip`` / ``moving_mip`` parameters.
+    """
+    dirpath.mkdir(parents=True, exist_ok=True)
+    datasets = []
+    for level, (array, scale) in enumerate(zip(arrays, scales)):
+        _write_zarr3_sharded(dirpath / str(level), array, ["x", "y", "z"])
+        datasets.append({"path": str(level), "coordinateTransformations": [
+            {"type": "scale", "scale": list(scale)}]})
+    group_meta = {
+        "zarr_format": 3, "node_type": "group",
+        "attributes": {"ome": {"multiscales": [{
+            "axes": [{"name": n, "type": "space", "unit": unit}
+                     for n in ["x", "y", "z"]],
+            "datasets": datasets,
+        }]}},
+    }
+    (dirpath / "zarr.json").write_text(json.dumps(group_meta))
+    return "zarr3://file://" + str(dirpath) + "/"
+
+
 def _state(scales, landmark, fixed_layer, moving_layer, units="nm"):
     state = neuroglancer.ViewerState()
     state.dimensions = neuroglancer.CoordinateSpace(
@@ -260,6 +285,36 @@ def test_refine_ome_multiscale_group(monkeypatch, tmp_path):
 
     correction = ngregister.refine_registration(size_voxels=60, apply=False)
     _assert_cancels_shift(correction, shift)
+
+
+def test_refine_per_layer_mip_compares_chosen_levels(monkeypatch, tmp_path):
+    """Fetch the fixed and moving layers at different multiscale levels.
+
+    The moving source is a 2-level OME group: level 0 at the global 4 nm frame,
+    level 1 a 2x decimation at 8 nm. Fetching moving at ``moving_mip=1`` must
+    resolve the level-1 path and its coarser native geometry, place the cutout in
+    the same global frame as the full-res fixed layer, and still recover the
+    injected shift (in global voxels).
+    """
+    scales = [4, 4, 4]
+    shift = np.array([4.0, -2.0, 2.0])                 # even -> exact under 2x decimation
+    vol = _texture()
+    moving = ndi.shift(vol, shift, order=1, mode="reflect")
+
+    fixed_url = _write_precomputed(tmp_path / "fixed", vol, scales)
+    moving_url = _write_ome_zarr3_levels(
+        tmp_path / "moving",
+        [moving, moving[::2, ::2, ::2]],
+        [[4, 4, 4], [8, 8, 8]])
+    state = _state(scales, [50, 50, 50],
+                   _image_layer(fixed_url), _image_layer(moving_url))
+    monkeypatch.setattr(ngregister, "viewer", types.SimpleNamespace(state=state))
+
+    correction = ngregister.refine_registration(
+        size_voxels=80, apply=False, fixed_mip=0, moving_mip=1)
+    # Coarser moving level -> looser tolerance than the same-level tests.
+    assert np.linalg.norm(correction[:3, 3] - (-shift)) < 2.0
+    assert np.allclose(correction[:3, :3], np.eye(3), atol=0.05)
 
 
 # ---------------------------------------------------------------------------
