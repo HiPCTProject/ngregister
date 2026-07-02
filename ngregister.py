@@ -5,6 +5,7 @@ import neuroglancer
 import neuroglancer.cli
 import numpy as np
 from scipy.spatial.transform import Rotation
+from scipy.signal import fftconvolve
 import datetime
 import atexit
 
@@ -736,32 +737,130 @@ def _model_transform(model, ndim, center):
     transform.SetCenter(center)
     return transform
 
-def register_pair(fixed_image, moving_image, metric="correlation", model="rigid"):
+def _fft_best_shift(fixed_array, moving_array, moving_mask, overlap_frac=0.3):
+    """Exhaustive best integer translation by masked normalized cross-correlation.
+
+    Returns the [a0, a1, a2] shift (in the arrays' own axis order) that best
+    aligns `moving_array` to `fixed_array`. FFT-based, so -- unlike a gradient
+    optimizer -- it searches every translation at once and finds a shift of a
+    hundred voxels as easily as one. `moving_mask` marks where the (resampled)
+    moving has real data; the masked NCC (Padfield) uses it so the zero-fill left
+    by resampling does not bias the correlation toward the coverage boundary (a
+    plain cross-correlation locks onto that instead of the anatomy). The fixed
+    array is treated as fully valid. Shifts whose overlap is below `overlap_frac`
+    of the maximum are ignored so a sliver of overlap cannot win spuriously.
+    """
+    fixed = fixed_array.astype(np.float64)
+    valid_fixed = np.ones_like(fixed)
+    mask = moving_mask.astype(np.float64)
+    moving = moving_array.astype(np.float64) * mask
+
+    def correlate(a, b):
+        return fftconvolve(a, b[::-1, ::-1, ::-1], mode="full")
+
+    overlap = correlate(valid_fixed, mask)
+    sum_fixed = correlate(fixed, mask)
+    sum_moving = correlate(valid_fixed, moving)
+    sum_fixed_sq = correlate(fixed * fixed, mask)
+    sum_moving_sq = correlate(valid_fixed, moving * moving)
+    sum_product = correlate(fixed, moving)
+
+    overlap = np.maximum(overlap, 1e-9)
+    numerator = sum_product - sum_fixed * sum_moving / overlap
+    var_fixed = np.maximum(sum_fixed_sq - sum_fixed ** 2 / overlap, 0.0)
+    var_moving = np.maximum(sum_moving_sq - sum_moving ** 2 / overlap, 0.0)
+    denominator = np.sqrt(var_fixed * var_moving)
+    ncc = np.where(denominator > 1e-9, numerator / np.maximum(denominator, 1e-9), 0.0)
+    ncc[overlap < overlap_frac * overlap.max()] = 0.0
+
+    peak = np.unravel_index(np.argmax(ncc), ncc.shape)
+    return np.array(peak) - (np.array(moving_array.shape) - 1)
+
+def global_prealign(fixed_image, moving_image, max_angle_deg=8.0, angle_step_deg=2.0):
+    """Coarse global rigid pre-alignment over z-rotation and full translation.
+
+    The local optimizer only converges from a near-aligned start, so a manual
+    alignment that is off by a large rotation or translation (well beyond its
+    capture range) leaves it wandering on noise. This searches z-rotations in
+    [-max_angle_deg, +max_angle_deg] exhaustively, pairing each with the globally
+    optimal translation from `_fft_best_shift`, and returns the Euler3DTransform
+    (fixed->moving) with the best honest overlap correlation, to seed the local
+    refinement. z-rotation matches ngregister's dominant gesture and the axis its
+    manual transforms rotate about; returns identity when no rotation beats it.
+
+    Returns (transform, score).
+    """
+    center = fixed_image.TransformContinuousIndexToPhysicalPoint(
+        [(sz - 1) / 2.0 for sz in fixed_image.GetSize()])
+    fixed_array = sitk.GetArrayViewFromImage(fixed_image).astype(np.float64)
+    direction = np.array(fixed_image.GetDirection()).reshape(3, 3)
+    spacing = np.array(fixed_image.GetSpacing())
+    ones = sitk.Add(sitk.Cast(moving_image * 0, sitk.sitkFloat32), 1.0)
+
+    best = (-np.inf, sitk.Euler3DTransform())
+    steps = int(round(max_angle_deg / angle_step_deg))
+    for step in range(-steps, steps + 1):
+        angle = np.deg2rad(step * angle_step_deg)
+        rotation = sitk.Euler3DTransform()
+        rotation.SetCenter([float(c) for c in center])
+        rotation.SetRotation(0.0, 0.0, angle)
+        moving_rotated = sitk.GetArrayViewFromImage(sitk.Resample(
+            moving_image, fixed_image, rotation, sitk.sitkLinear, 0.0,
+            sitk.sitkFloat32)).astype(np.float64)
+        coverage = sitk.GetArrayViewFromImage(sitk.Resample(
+            ones, fixed_image, rotation, sitk.sitkNearestNeighbor, 0.0,
+            sitk.sitkFloat32)) > 0.5
+        shift = _fft_best_shift(fixed_array, moving_rotated, coverage)  # [a0,a1,a2]
+        # array axes are [z, y, x]; physical shift folds in the fixed geometry.
+        shift_xyz = shift[::-1]
+        shift_phys = direction @ (spacing * shift_xyz)
+        linear = np.array(rotation.GetMatrix()).reshape(3, 3)
+        candidate = sitk.Euler3DTransform()
+        candidate.SetCenter([float(c) for c in center])
+        candidate.SetRotation(0.0, 0.0, angle)
+        candidate.SetTranslation([float(v) for v in -(linear @ shift_phys)])
+        score = overlap_correlation(fixed_image, moving_image, sitk.Transform(candidate))
+        if score > best[0]:
+            best = (score, candidate)
+    return best[1], best[0]
+
+def register_pair(fixed_image, moving_image, metric="correlation", model="rigid",
+                  initial_transform=None):
     """Register `moving` to `fixed` in their shared physical space.
 
     Returns the SimpleITK transform T mapping fixed physical points to moving
     physical points. The images already share a physical frame (both are
     fetched into global physical space), so the transform starts at identity.
 
-    Registration is staged: a translation pass first, then the chosen `model`
-    initialized from it. A from-scratch 12-DOF affine tends to misuse its extra
-    degrees of freedom (spurious rotation/shear) on what is mostly a residual
-    shift; staging, plus constraining `model` to 'rigid'/'similarity', converges
-    far more reliably. The model is centered on the data: the cutout sits at
-    large physical coordinates (its array-index origin is thousands of voxels
-    from 0), so a transform centered at (0,0,0) would map tiny linear-parameter
-    changes to huge point shifts, and SetOptimizerScalesFromPhysicalShift would
-    then freeze the linear DOF so only the translation moves.
+    Registration is staged: a translation pass first (or, when `initial_transform`
+    is given, that coarse pre-alignment), then the chosen `model` initialized from
+    it. A from-scratch 12-DOF affine tends to misuse its extra degrees of freedom
+    (spurious rotation/shear) on what is mostly a residual shift; staging, plus
+    constraining `model` to 'rigid'/'similarity', converges far more reliably. The
+    model is centered on the data: the cutout sits at large physical coordinates
+    (its array-index origin is thousands of voxels from 0), so a transform centered
+    at (0,0,0) would map tiny linear-parameter changes to huge point shifts, and
+    SetOptimizerScalesFromPhysicalShift would then freeze the linear DOF so only
+    the translation moves.
+
+    `initial_transform` (e.g. from `global_prealign`) seeds the model with a
+    rotation+translation the local optimizer could not reach on its own; when None
+    the translation pass supplies the starting offset.
     """
     ndim = fixed_image.GetDimension()
-
-    translation = sitk.TranslationTransform(ndim)
-    _registration_method(translation, metric).Execute(fixed_image, moving_image)
 
     center = fixed_image.TransformContinuousIndexToPhysicalPoint(
         [(sz - 1) / 2.0 for sz in fixed_image.GetSize()])
     transform = _model_transform(model, ndim, center)
-    transform.SetTranslation(translation.GetOffset())
+    if initial_transform is None:
+        translation = sitk.TranslationTransform(ndim)
+        _registration_method(translation, metric).Execute(fixed_image, moving_image)
+        transform.SetTranslation(translation.GetOffset())
+    else:
+        # Seed the model to match the pre-alignment. Both share `center`, so
+        # copying its orthonormal matrix and translation reproduces its action.
+        transform.SetMatrix(initial_transform.GetMatrix())
+        transform.SetTranslation(initial_transform.GetTranslation())
     _registration_method(transform, metric).Execute(fixed_image, moving_image)
 
     return sitk.Transform(transform)
@@ -866,7 +965,8 @@ def landmark_point(state, ndim):
 def refine_registration(size_voxels=200, fixed=None, moving=None, mip=0, apply=True,
                         metric="correlation", model="rigid",
                         fixed_mip=None, moving_mip=None, use_shader_window=True,
-                        guard=True, max_shift_voxels=None, min_correlation=0.1):
+                        guard=True, max_shift_voxels=None, min_correlation=0.1,
+                        prealign=True, prealign_max_angle=8.0, prealign_step=2.0):
     """Refine the moving layer's registration around the landmark.
 
     Callable from the interactive (`python -i`) session. Fetches a cube of
@@ -891,13 +991,23 @@ def refine_registration(size_voxels=200, fixed=None, moving=None, mip=0, apply=T
     use the same meaningful contrast; falls back to min/max when a layer has no
     shader window. Set False to force min/max normalization.
 
+    `prealign` (default on) runs `global_prealign` first: a coarse exhaustive
+    search over z-rotation (+-`prealign_max_angle` degrees, step `prealign_step`)
+    and full FFT translation, seeding the local optimizer with a rotation and
+    translation it could not otherwise reach. This is what recovers a manual
+    alignment that is off by several degrees and many voxels (the local optimizer
+    only has a small capture range and would just wander). Set False to start the
+    local optimizer from the current alignment.
+
     `guard` (default on) rejects a result whose overlap cross-correlation stays
     below `min_correlation` (default 0.1 -- essentially no shared structure) or
-    that moves the box by more than `max_shift_voxels` (default a quarter of the
-    smallest box side). On a featureless landmark box the optimized metric can
+    that moves the box by more than `max_shift_voxels` (default half the smallest
+    box side). On a featureless landmark box the optimized metric can
     still be nudged down by fitting noise, so the guard judges real alignment with
     an independent cross-correlation and applies nothing rather than wandering off
     the (already-good) manual alignment. Set False to always apply the raw result.
+    With `prealign` the box displacement can legitimately be large, so raise
+    `max_shift_voxels` when recovering a big manual error.
 
     Returns the 4x4 global-voxel correction matrix that was applied (identity if
     the guard rejected the result).
@@ -944,7 +1054,17 @@ def refine_registration(size_voxels=200, fixed=None, moving=None, mip=0, apply=T
         intensity_window=moving_window,
     )
 
-    transform = register_pair(fixed_image, moving_image, metric=metric, model=model)
+    initial_transform = None
+    if prealign:
+        initial_transform, prealign_score = global_prealign(
+            fixed_image, moving_image,
+            max_angle_deg=prealign_max_angle, angle_step_deg=prealign_step)
+        angle_z = np.rad2deg(initial_transform.GetAngleZ())
+        print(f"refine: prealign z-rotation {angle_z:+.1f} deg "
+              f"(overlap correlation {prealign_score:.3g})")
+
+    transform = register_pair(fixed_image, moving_image, metric=metric, model=model,
+                              initial_transform=initial_transform)
 
     # T maps fixed physical -> moving physical. The spatial correction to apply
     # to the moving layer is C = T^-1 (move the moving feature now at T(p) to p).
@@ -974,7 +1094,10 @@ def refine_registration(size_voxels=200, fixed=None, moving=None, mip=0, apply=T
         # optimized metric can be nudged down by fitting noise on a featureless
         # box, but genuine shared structure shows up as overlap correlation.
         correlation = overlap_correlation(fixed_image, moving_image, transform)
-        limit = (float(np.min(size_voxels)) / 4.0 if max_shift_voxels is None
+        # Allow up to half the box (beyond that the overlap vanishes); prealign
+        # legitimately recovers large manual errors, and the correlation gate is
+        # the real validator of whether a big correction is trustworthy.
+        limit = (float(np.min(size_voxels)) / 2.0 if max_shift_voxels is None
                  else float(max_shift_voxels))
         reason = None
         if not np.isfinite(correlation) or abs(correlation) < min_correlation:

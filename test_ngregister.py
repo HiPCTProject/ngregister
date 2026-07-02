@@ -304,6 +304,26 @@ def test_refine_guard_accepts_real_shift(monkeypatch, tmp_path):
     _assert_cancels_shift(correction, shift)           # accepted and correct
 
 
+def test_refine_prealign_recovers_rotation(monkeypatch, tmp_path):
+    # The moving volume is rotated ~6 deg about z -- beyond the local optimizer's
+    # capture range from a cold start. The global prealign must find the rotation
+    # so the correction cancels it (a z-rotation of the same magnitude).
+    scales = [4, 4, 4]
+    vol = _texture()
+    moving = ndi.rotate(vol, 6.0, axes=(1, 2), reshape=False, order=1, mode="reflect")
+    fixed_url = _write_precomputed(tmp_path / "fixed", vol, scales)
+    moving_url = _write_precomputed(tmp_path / "moving", moving, scales)
+    state = _state(scales, [50, 50, 50],
+                   _image_layer(fixed_url), _image_layer(moving_url))
+    monkeypatch.setattr(ngregister, "viewer", types.SimpleNamespace(state=state))
+
+    correction = ngregister.refine_registration(size_voxels=70, apply=False)
+    rotation = correction[:3, :3]
+    angle = np.degrees(np.arccos(np.clip((np.trace(rotation) - 1) / 2, -1, 1)))
+    assert 4.0 < angle < 8.0                           # ~6 deg recovered
+    assert abs(rotation[2, 2] - 1.0) < 0.02            # about the z axis
+
+
 def test_refine_ome_multiscale_group(monkeypatch, tmp_path):
     scales = [4, 4, 8]
     shift = np.array([2.0, -1.0, 1.0])

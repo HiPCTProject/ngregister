@@ -107,9 +107,21 @@ ITK sees O(1) spacings; the common factor cancels in the round-trip) by
 setting the image origin/spacing/direction from the layer affine (`polar_decompose` splits its
 linear part into an orthonormal direction + per-axis spacing; assumes no shear, which is what
 ngregister's gestures produce). Both images thus share a frame, so registration starts at identity.
-`register_pair` is staged (translation, then the chosen `model` via `_model_transform`) with a gentle
-`[2,1]` pyramid and a RegularStepGradientDescent optimizer — an aggressive pyramid or a from-scratch
-12-DOF affine diverges on small subvolumes. The second-stage transform is **centered on the image**
+
+Before the local optimizer, a `prealign` (default on) runs `global_prealign`: a coarse exhaustive
+search over z-rotation (+-`prealign_max_angle`, step `prealign_step`) paired with a full FFT
+translation from `_fft_best_shift`. The local optimizer only converges from a near-aligned start, so a
+manual alignment off by several degrees and many voxels (well beyond its capture range) leaves it
+wandering on noise; the prealign seeds it with the best rotation+translation, scored by the honest
+`overlap_correlation`. `_fft_best_shift` uses **masked** normalized cross-correlation (Padfield) with
+the moving coverage mask — a plain cross-correlation locks onto the zero-fill coverage boundary left by
+resampling instead of the anatomy. z-rotation matches ngregister's dominant gesture and the axis its
+manual transforms rotate about. The seed passes to `register_pair` as `initial_transform`.
+
+`register_pair` is staged (translation or the prealign seed, then the chosen `model` via
+`_model_transform`) with a gentle `[2,1]` pyramid and a RegularStepGradientDescent optimizer — an
+aggressive pyramid or a from-scratch 12-DOF affine diverges on small subvolumes. The second-stage
+transform is **centered on the image**
 (`TransformContinuousIndexToPhysicalPoint` of the size midpoint): the cutout sits thousands of voxels
 from the physical origin, so a transform centered at 0 would make `SetOptimizerScalesFromPhysicalShift`
 freeze the linear DOF and only the translation would move. The SimpleITK transform `T` maps
@@ -123,9 +135,12 @@ nudged down by fitting noise on a featureless box, the guard judges *real* align
 independent measure — `overlap_correlation` resamples moving onto the fixed grid through `T` and takes
 the Pearson correlation over the covered region — and rejects (returns identity, applies nothing) when
 it stays below `min_correlation` (default 0.1) or when the box displacement exceeds `max_shift_voxels`
-(default a quarter of the smallest box side). This is what stops a landmark box lacking structure
-shared by both layers (e.g. a 20 um overview vs a 4.257 um VOI, which barely correlate) from wandering
-off the good manual alignment; `guard=False` applies the raw result.
+(default half the smallest box side — prealign legitimately recovers large errors, so the correlation
+gate is the real validator). This is what stops a landmark box lacking structure shared by both layers
+(e.g. a 20 um overview vs a 4.257 um VOI in a region with no feature both can resolve) from wandering
+off the good manual alignment; `guard=False` applies the raw result. On the issue-5 state the prealign
+finds a -2 deg z-rotation and ~99-voxel shift the local optimizer could not reach, lifting the overlap
+correlation from ~0.003 (identity) to ~0.27 so the guard accepts it.
 
 Layer roles come from name prefixes: `mark-layer-moving` / `mark-layer-reference` (keys
 `alt+m` / `alt+r`) rename the active layer with a `mov::` / `ref::` prefix (constants
