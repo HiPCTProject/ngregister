@@ -108,15 +108,21 @@ setting the image origin/spacing/direction from the layer affine (`polar_decompo
 linear part into an orthonormal direction + per-axis spacing; assumes no shear, which is what
 ngregister's gestures produce). Both images thus share a frame, so registration starts at identity.
 
-Before the local optimizer, a `prealign` (default on) runs `global_prealign`: a coarse exhaustive
-search over z-rotation (+-`prealign_max_angle`, step `prealign_step`) paired with a full FFT
-translation from `_fft_best_shift`. The local optimizer only converges from a near-aligned start, so a
-manual alignment off by several degrees and many voxels (well beyond its capture range) leaves it
-wandering on noise; the prealign seeds it with the best rotation+translation, scored by the honest
-`overlap_correlation`. `_fft_best_shift` uses **masked** normalized cross-correlation (Padfield) with
-the moving coverage mask — a plain cross-correlation locks onto the zero-fill coverage boundary left by
-resampling instead of the anatomy. z-rotation matches ngregister's dominant gesture and the axis its
-manual transforms rotate about. The seed passes to `register_pair` as `initial_transform`.
+Before the local optimizer, a `prealign` (default on) runs `global_prealign`: a coarse search over 3D
+rotation (all three axes, no assumed axis; +-`prealign_max_angle`, step `prealign_step`) paired with a
+full FFT translation from `_fft_best_shift`. The local optimizer only converges from a near-aligned
+start, so a manual alignment off by several degrees and many voxels (well beyond its capture range)
+leaves it wandering on noise; the prealign seeds it with the best rotation+translation. The three axes
+are swept by **coordinate descent** (each axis in turn, holding the others at their running best,
+repeated `passes` times, default 1) so the cost is ~`passes*3*n_angles` evaluations rather than the
+cube of a full grid; the local optimizer then polishes the coupling. `_fft_best_shift` uses **masked**
+normalized cross-correlation (Padfield) with the moving coverage mask — a plain cross-correlation locks
+onto the zero-fill coverage boundary left by resampling instead of the anatomy — and returns the NCC at
+its peak, which is the overlap correlation at that shift and doubles as the candidate score (no extra
+resample per evaluation). The current alignment is the baseline candidate and a rotated one is only
+returned if it strictly beats it, so prealign is **monotonic** (never seeds something worse); it
+returns `None` when nothing beats the baseline, and `register_pair` then falls back to its
+translation-first staging. The seed otherwise passes to `register_pair` as `initial_transform`.
 
 `register_pair` is staged (translation or the prealign seed, then the chosen `model` via
 `_model_transform`) with a gentle `[2,1]` pyramid and a RegularStepGradientDescent optimizer — an
@@ -146,6 +152,13 @@ Layer roles come from name prefixes: `mark-layer-moving` / `mark-layer-reference
 `alt+m` / `alt+r`) rename the active layer with a `mov::` / `ref::` prefix (constants
 `MOVING_PREFIX` / `REFERENCE_PREFIX`). `resolve_roles` reads those prefixes, else falls back
 to active=moving / other-image-layer=fixed, else raises.
+
+`chain_to_layer_space(target=None)` (also a REPL function) re-bases the world into one chosen image's
+frame: it left-multiplies every image layer's `source[0].transform` by `inv(M_target)` so the target
+layer's matrix becomes the identity and the others are expressed relative to it (units unchanged), and
+maps the single `__LANDMARK__` point the same way so it stays on its feature. The target is `target`,
+else the single `ref::` layer, else the selected layer (`_resolve_target_layer`); `apply=False` is a
+dry run returning `inv(M_target)` without writing.
 
 ## Adding a new registration gesture
 

@@ -414,6 +414,81 @@ def test_refine_shader_window_normalization_recovers_shift(monkeypatch, tmp_path
     _assert_cancels_shift(correction, shift)
 
 
+class _FakeViewer:
+    """Minimal viewer whose txn() mutates the same state (no server)."""
+    def __init__(self, state):
+        self.state = state
+    def txn(self):
+        import contextlib
+        @contextlib.contextmanager
+        def _cm():
+            yield self.state
+        return _cm()
+
+
+def test_chain_to_layer_space_rebases_and_moves_landmark(monkeypatch):
+    angle = np.deg2rad(5.0)
+    target_matrix = [
+        [np.cos(angle), -np.sin(angle), 0.0, 10.0],
+        [np.sin(angle), np.cos(angle), 0.0, -20.0],
+        [0.0, 0.0, 1.0, 5.0],
+    ]
+    other_matrix = [
+        [1.0, 0.0, 0.0, 3.0],
+        [0.0, 1.0, 0.0, 4.0],
+        [0.0, 0.0, 1.0, -2.0],
+    ]
+    dims = neuroglancer.CoordinateSpace(names=["x", "y", "z"], units="nm", scales=[4, 4, 4])
+    state = _state([4, 4, 4], [30, 40, 50],
+                   _image_layer("precomputed://a", matrix=target_matrix, dims=dims),
+                   _image_layer("precomputed://b", matrix=other_matrix, dims=dims))
+    # _state names the fixed layer "ref::fix" -> it is the default target.
+    monkeypatch.setattr(ngregister, "viewer", _FakeViewer(state))
+
+    target_inv = np.linalg.inv(np.vstack([target_matrix, [0, 0, 0, 1]]))
+    other = np.vstack([other_matrix, [0, 0, 0, 1]])
+
+    ngregister.chain_to_layer_space()                  # default target = ref:: layer
+
+    after = ngregister.viewer.state
+    # target layer is now identity
+    np.testing.assert_allclose(
+        ngregister.layer_transform_matrix(after.layers["ref::fix"].layer, 3),
+        np.eye(4), atol=1e-9)
+    # the other layer is expressed relative to the target
+    np.testing.assert_allclose(
+        ngregister.layer_transform_matrix(after.layers["mov::mov"].layer, 3),
+        target_inv @ other, atol=1e-9)
+    # landmark point mapped by inv(M_target)
+    moved = (target_inv @ np.array([30, 40, 50, 1.0]))[:3]
+    np.testing.assert_allclose(
+        after.layers["__LANDMARK__"].annotations[0].point, moved, atol=1e-6)
+
+
+def test_chain_to_layer_space_explicit_target_and_dry_run(monkeypatch):
+    dims = neuroglancer.CoordinateSpace(names=["x", "y", "z"], units="nm", scales=[4, 4, 4])
+    mov_matrix = [[1.0, 0.0, 0.0, 7.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0]]
+    state = _state([4, 4, 4], [10, 10, 10],
+                   _image_layer("precomputed://a"),
+                   _image_layer("precomputed://b", matrix=mov_matrix, dims=dims))
+    monkeypatch.setattr(ngregister, "viewer", _FakeViewer(state))
+
+    # Dry run returns inv(M_target) but must not modify the state.
+    result = ngregister.chain_to_layer_space(target="mov::mov", apply=False)
+    np.testing.assert_allclose(result, np.linalg.inv(np.vstack([mov_matrix, [0, 0, 0, 1]])))
+    np.testing.assert_allclose(
+        ngregister.layer_transform_matrix(ngregister.viewer.state.layers["mov::mov"].layer, 3),
+        np.vstack([mov_matrix, [0, 0, 0, 1]]), atol=1e-9)   # unchanged
+
+    # A non-image target is rejected.
+    try:
+        ngregister.chain_to_layer_space(target="__LANDMARK__")
+    except ValueError as exc:
+        assert "not an image layer" in str(exc)
+    else:
+        raise AssertionError("expected ValueError for annotation target")
+
+
 def test_source_url_to_spec_selects_driver_and_scale():
     spec = ngregister.source_url_to_spec("precomputed://gs://b/p", mip=2)
     assert spec == {"driver": "neuroglancer_precomputed",

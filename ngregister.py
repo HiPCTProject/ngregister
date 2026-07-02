@@ -740,8 +740,10 @@ def _model_transform(model, ndim, center):
 def _fft_best_shift(fixed_array, moving_array, moving_mask, overlap_frac=0.3):
     """Exhaustive best integer translation by masked normalized cross-correlation.
 
-    Returns the [a0, a1, a2] shift (in the arrays' own axis order) that best
-    aligns `moving_array` to `fixed_array`. FFT-based, so -- unlike a gradient
+    Returns ``(shift, ncc)``: the [a0, a1, a2] shift (in the arrays' own axis
+    order) that best aligns `moving_array` to `fixed_array`, and the overlap
+    normalized cross-correlation there (a ready alignment score, so the caller
+    need not re-resample to grade the fit). FFT-based, so -- unlike a gradient
     optimizer -- it searches every translation at once and finds a shift of a
     hundred voxels as easily as one. `moving_mask` marks where the (resampled)
     moving has real data; the masked NCC (Padfield) uses it so the zero-fill left
@@ -774,54 +776,85 @@ def _fft_best_shift(fixed_array, moving_array, moving_mask, overlap_frac=0.3):
     ncc[overlap < overlap_frac * overlap.max()] = 0.0
 
     peak = np.unravel_index(np.argmax(ncc), ncc.shape)
-    return np.array(peak) - (np.array(moving_array.shape) - 1)
+    shift = np.array(peak) - (np.array(moving_array.shape) - 1)
+    return shift, float(ncc[peak])            # (shift [a0,a1,a2], overlap NCC at it)
 
-def global_prealign(fixed_image, moving_image, max_angle_deg=8.0, angle_step_deg=2.0):
-    """Coarse global rigid pre-alignment over z-rotation and full translation.
+def global_prealign(fixed_image, moving_image, max_angle_deg=8.0, angle_step_deg=2.0,
+                    passes=1):
+    """Coarse global rigid pre-alignment over 3D rotation and full translation.
 
     The local optimizer only converges from a near-aligned start, so a manual
     alignment that is off by a large rotation or translation (well beyond its
-    capture range) leaves it wandering on noise. This searches z-rotations in
-    [-max_angle_deg, +max_angle_deg] exhaustively, pairing each with the globally
-    optimal translation from `_fft_best_shift`, and returns the Euler3DTransform
-    (fixed->moving) with the best honest overlap correlation, to seed the local
-    refinement. z-rotation matches ngregister's dominant gesture and the axis its
-    manual transforms rotate about; returns identity when no rotation beats it.
+    capture range) leaves it wandering on noise. This searches rotations about all
+    three axes in [-max_angle_deg, +max_angle_deg] (no assumed axis), pairing each
+    with the globally optimal translation from `_fft_best_shift`, and returns the
+    Euler3DTransform (fixed->moving) with the best honest overlap correlation to
+    seed the local refinement. The three axes are swept by coordinate descent
+    (each axis in turn, holding the others at their running best, repeated
+    `passes` times) so the cost stays ~`passes * 3 * n_angles` rather than the
+    cube of a full 3D grid; the local optimizer then polishes the coupling.
 
-    Returns (transform, score).
+    The current alignment (identity) is the baseline candidate, and a rotated
+    candidate is only returned if it strictly beats it: prealign is thus monotonic
+    -- it can only improve on the starting alignment, never seed the local
+    optimizer with something worse. Returns ``(None, baseline_score)`` when nothing
+    beats the baseline, so `register_pair` falls back to its robust
+    translation-first staging.
+
+    Returns (transform_or_None, score).
     """
-    center = fixed_image.TransformContinuousIndexToPhysicalPoint(
-        [(sz - 1) / 2.0 for sz in fixed_image.GetSize()])
+    center = [float(c) for c in fixed_image.TransformContinuousIndexToPhysicalPoint(
+        [(sz - 1) / 2.0 for sz in fixed_image.GetSize()])]
     fixed_array = sitk.GetArrayViewFromImage(fixed_image).astype(np.float64)
     direction = np.array(fixed_image.GetDirection()).reshape(3, 3)
     spacing = np.array(fixed_image.GetSpacing())
     ones = sitk.Add(sitk.Cast(moving_image * 0, sitk.sitkFloat32), 1.0)
 
-    best = (-np.inf, sitk.Euler3DTransform())
-    steps = int(round(max_angle_deg / angle_step_deg))
-    for step in range(-steps, steps + 1):
-        angle = np.deg2rad(step * angle_step_deg)
+    def evaluate(angles_xyz):
+        """Best transform (rotation angles_xyz + FFT translation) and its score.
+
+        The masked-NCC peak from `_fft_best_shift` is the overlap correlation at
+        the chosen shift, so it doubles as the score -- no extra resample needed.
+        """
+        radians = [np.deg2rad(a) for a in angles_xyz]
         rotation = sitk.Euler3DTransform()
-        rotation.SetCenter([float(c) for c in center])
-        rotation.SetRotation(0.0, 0.0, angle)
+        rotation.SetCenter(center)
+        rotation.SetRotation(*radians)
         moving_rotated = sitk.GetArrayViewFromImage(sitk.Resample(
             moving_image, fixed_image, rotation, sitk.sitkLinear, 0.0,
             sitk.sitkFloat32)).astype(np.float64)
         coverage = sitk.GetArrayViewFromImage(sitk.Resample(
             ones, fixed_image, rotation, sitk.sitkNearestNeighbor, 0.0,
             sitk.sitkFloat32)) > 0.5
-        shift = _fft_best_shift(fixed_array, moving_rotated, coverage)  # [a0,a1,a2]
+        shift, score = _fft_best_shift(fixed_array, moving_rotated, coverage)  # [a0,a1,a2]
         # array axes are [z, y, x]; physical shift folds in the fixed geometry.
-        shift_xyz = shift[::-1]
-        shift_phys = direction @ (spacing * shift_xyz)
+        shift_phys = direction @ (spacing * shift[::-1])
         linear = np.array(rotation.GetMatrix()).reshape(3, 3)
         candidate = sitk.Euler3DTransform()
-        candidate.SetCenter([float(c) for c in center])
-        candidate.SetRotation(0.0, 0.0, angle)
+        candidate.SetCenter(center)
+        candidate.SetRotation(*radians)
         candidate.SetTranslation([float(v) for v in -(linear @ shift_phys)])
-        score = overlap_correlation(fixed_image, moving_image, sitk.Transform(candidate))
-        if score > best[0]:
-            best = (score, candidate)
+        return score, candidate
+
+    identity = sitk.Euler3DTransform()
+    identity.SetCenter(center)
+    best = (overlap_correlation(fixed_image, moving_image, sitk.Transform(identity)), None)
+
+    steps = int(round(max_angle_deg / angle_step_deg))
+    grid = [s * angle_step_deg for s in range(-steps, steps + 1)]
+    current = [0.0, 0.0, 0.0]                          # working angles (x, y, z)
+    for _ in range(passes):
+        for axis in range(3):
+            axis_best = (best[0], current[axis])
+            for angle in grid:
+                trial = list(current)
+                trial[axis] = angle
+                score, candidate = evaluate(trial)
+                if score > best[0]:
+                    best = (score, candidate)
+                if score > axis_best[0]:
+                    axis_best = (score, angle)
+            current[axis] = axis_best[1]               # descend along this axis
     return best[1], best[0]
 
 def register_pair(fixed_image, moving_image, metric="correlation", model="rigid",
@@ -1059,9 +1092,17 @@ def refine_registration(size_voxels=200, fixed=None, moving=None, mip=0, apply=T
         initial_transform, prealign_score = global_prealign(
             fixed_image, moving_image,
             max_angle_deg=prealign_max_angle, angle_step_deg=prealign_step)
-        angle_z = np.rad2deg(initial_transform.GetAngleZ())
-        print(f"refine: prealign z-rotation {angle_z:+.1f} deg "
-              f"(overlap correlation {prealign_score:.3g})")
+        if initial_transform is None:
+            print("refine: prealign found no rotation better than the current "
+                  f"alignment (overlap correlation {prealign_score:.3g}); "
+                  "starting the local optimizer from it")
+        else:
+            angles = np.rad2deg([initial_transform.GetAngleX(),
+                                 initial_transform.GetAngleY(),
+                                 initial_transform.GetAngleZ()])
+            print(f"refine: prealign rotation (x,y,z) "
+                  f"{angles[0]:+.1f},{angles[1]:+.1f},{angles[2]:+.1f} deg "
+                  f"(overlap correlation {prealign_score:.3g})")
 
     transform = register_pair(fixed_image, moving_image, metric=metric, model=model,
                               initial_transform=initial_transform)
@@ -1121,6 +1162,69 @@ def refine_registration(size_voxels=200, fixed=None, moving=None, mip=0, apply=T
         save_state_in_history()
 
     return c_vox
+
+def _resolve_target_layer(state, target):
+    """Name of the layer whose space to chain into.
+
+    Explicit `target`, else the single ref:: tagged layer, else the selected
+    layer. Must be an image layer (it needs a source transform).
+    """
+    if target is None:
+        tagged = [l.name for l in state.layers if l.name.startswith(REFERENCE_PREFIX)]
+        target = tagged[0] if len(tagged) == 1 else state.selectedLayer.layer
+    if target not in state.layers or not _is_image_layer(state.layers[target]):
+        raise ValueError(
+            f"chain: target '{target}' is not an image layer. Pass target=<name>, "
+            "tag a reference with alt+r, or select an image layer.")
+    return target
+
+def chain_to_layer_space(target=None, apply=True):
+    """Re-express every image layer in one chosen image's coordinate space.
+
+    Callable from the interactive (`python -i`) session, like refine_registration.
+    Picks a target image layer (`target` name, else the single ref:: tagged
+    layer, else the selected layer) and left-multiplies every image layer's
+    source[0].transform by inv(M_target). The target layer's matrix therefore
+    becomes the identity and every other layer is expressed relative to it; the
+    global dimensions (scales/units) are unchanged. The single __LANDMARK__ point
+    annotation is mapped by the same inv(M_target) so it stays on its feature.
+
+    Returns the 4x4 inv(M_target) that was applied.
+    """
+    global viewer
+    state = viewer.state
+    ndim = len(state.dimensions.scales)
+    target_name = _resolve_target_layer(state, target)
+    target_inverse = np.linalg.inv(
+        layer_transform_matrix(state.layers[target_name].layer, ndim))
+
+    if not apply:
+        print(f"chain: target '{target_name}' (dry run, nothing written).")
+        return target_inverse
+
+    with viewer.txn() as v:
+        output_dimensions = v.dimensions.to_json()
+        for managed in v.layers:
+            if not _is_image_layer(managed):
+                continue
+            rebased = target_inverse @ layer_transform_matrix(managed.layer, ndim)
+            transform = neuroglancer.CoordinateSpaceTransform(
+                {"matrix": rebased[:ndim, : ndim + 1].tolist(),
+                 "outputDimensions": output_dimensions})
+            managed.layer.source[0] = neuroglancer.LayerDataSource(
+                {"url": managed.layer.source[0].url, "transform": transform.to_json()})
+
+        if "__LANDMARK__" in v.layers and len(v.layers["__LANDMARK__"].annotations) >= 1:
+            annotation = v.layers["__LANDMARK__"].annotations[0]
+            point = np.array(annotation.point, dtype=float)
+            moved = (target_inverse @ np.append(point, 1.0))[:ndim]
+            v.layers["__LANDMARK__"].annotations[0] = neuroglancer.PointAnnotation(
+                id=annotation.id, point=moved.tolist())
+
+    print(f"chain: '{target_name}' is now the identity space; "
+          "all image layers and the landmark re-expressed relative to it.")
+    save_state_in_history()
+    return target_inverse
 
 def print_last_state():
     print(neuroglancer.to_url(viewer.state))
