@@ -284,19 +284,32 @@ def _strip_role_prefix(name):
             return name[len(prefix):]
     return name
 
-def mark_active_layer(prefix):
+def mark_active_layer(prefix, name=None):
     global viewer
     with viewer.txn() as v:
-        name = v.selectedLayer.layer
+        if name is None:
+            name = v.selectedLayer.layer
         if name is None or name not in v.layers:
+            print(f"mark: no layer to tag (name={name!r}); select a layer in the "
+                  "viewer or pass name='<layer>'.")
             return
-        v.layers[name].name = prefix + _strip_role_prefix(name)
+        new_name = prefix + _strip_role_prefix(name)
+        v.layers[name].name = new_name
+        print(f"mark: '{name}' -> '{new_name}'")
 
-def mark_layer_moving(s):
+def mark_layer_moving(s=None):
     mark_active_layer(MOVING_PREFIX)
 
-def mark_layer_reference(s):
+def mark_layer_reference(s=None):
     mark_active_layer(REFERENCE_PREFIX)
+
+# REPL-callable equivalents of the alt+m / alt+r keybindings, for when the
+# browser swallows the Alt+key shortcut. `name` defaults to the selected layer.
+def mark_moving(name=None):
+    mark_active_layer(MOVING_PREFIX, name)
+
+def mark_reference(name=None):
+    mark_active_layer(REFERENCE_PREFIX, name)
 
 # Neuroglancer data-source format -> TensorStore driver.
 _DRIVER_BY_FORMAT = {
@@ -943,7 +956,8 @@ def transform_to_matrix(transform, ndim):
     return matrix
 
 def _is_image_layer(layer):
-    return getattr(layer.layer, "type", None) == "image"
+    return (isinstance(layer.layer, neuroglancer.ImageLayer)
+            or getattr(layer.layer, "type", None) == "image")
 
 def resolve_roles(state, fixed=None, moving=None):
     """Determine the (fixed_name, moving_name) layer pair.
@@ -1172,10 +1186,16 @@ def _resolve_target_layer(state, target):
     if target is None:
         tagged = [l.name for l in state.layers if l.name.startswith(REFERENCE_PREFIX)]
         target = tagged[0] if len(tagged) == 1 else state.selectedLayer.layer
-    if target not in state.layers or not _is_image_layer(state.layers[target]):
+    image_layers = [l.name for l in state.layers if _is_image_layer(l)]
+    if target not in state.layers:
         raise ValueError(
-            f"chain: target '{target}' is not an image layer. Pass target=<name>, "
-            "tag a reference with alt+r, or select an image layer.")
+            f"chain: target '{target}' is not a layer. Image layers: {image_layers}. "
+            "Pass target='<name>'.")
+    if target not in image_layers:
+        detected = getattr(state.layers[target].layer, "type", None)
+        raise ValueError(
+            f"chain: target '{target}' is not an image layer (type={detected!r}). "
+            f"Image layers: {image_layers}. Pass target='<name>'.")
     return target
 
 def chain_to_layer_space(target=None, apply=True):
