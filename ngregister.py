@@ -1220,6 +1220,11 @@ def chain_to_layer_space(target=None, apply=True):
     global viewer
     state = viewer.state
     ndim = len(state.dimensions.scales)
+    if ndim == 0:
+        raise ValueError(
+            "chain: the viewer has no global dimensions (viewer.state.dimensions "
+            "is empty); refusing to rewrite layer transforms, which would corrupt "
+            "the state. Load a state with top-level 'dimensions' first.")
     target_name = _resolve_target_layer(state, target)
     target_inverse = np.linalg.inv(
         layer_transform_matrix(state.layers[target_name].layer, ndim))
