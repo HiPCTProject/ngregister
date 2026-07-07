@@ -1233,17 +1233,22 @@ def chain_to_layer_space(target=None, apply=True):
         print(f"chain: target '{target_name}' (dry run, nothing written).")
         return target_inverse
 
+    save_state_in_history()                            # restore point before the rewrite
     with viewer.txn() as v:
         output_dimensions = v.dimensions.to_json()
-        for managed in v.layers:
-            if not _is_image_layer(managed):
-                continue
-            rebased = target_inverse @ layer_transform_matrix(managed.layer, ndim)
+        # Collect names first, then index by name to rewrite each source -- the
+        # same pattern apply_transform_to_layer uses. Reassigning `.source` while
+        # iterating `v.layers` can corrupt the layer list when the change syncs to
+        # the browser.
+        image_names = [l.name for l in v.layers if _is_image_layer(l)]
+        for name in image_names:
+            layer = v.layers[name].layer
+            rebased = target_inverse @ layer_transform_matrix(layer, ndim)
             transform = neuroglancer.CoordinateSpaceTransform(
                 {"matrix": rebased[:ndim, : ndim + 1].tolist(),
                  "outputDimensions": output_dimensions})
-            managed.layer.source[0] = neuroglancer.LayerDataSource(
-                {"url": managed.layer.source[0].url, "transform": transform.to_json()})
+            v.layers[name].layer.source[0] = neuroglancer.LayerDataSource(
+                {"url": layer.source[0].url, "transform": transform.to_json()})
 
         if "__LANDMARK__" in v.layers and len(v.layers["__LANDMARK__"].annotations) >= 1:
             annotation = v.layers["__LANDMARK__"].annotations[0]
@@ -1254,7 +1259,6 @@ def chain_to_layer_space(target=None, apply=True):
 
     print(f"chain: '{target_name}' is now the identity space; "
           "all image layers and the landmark re-expressed relative to it.")
-    save_state_in_history()
     return target_inverse
 
 def print_last_state():
