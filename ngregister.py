@@ -1071,6 +1071,12 @@ def refine_registration(size_voxels=200, fixed=None, moving=None, mip=0, apply=T
     # round-trip below).
     global_scale_phys = np.array(dims.scales, dtype=float) * np.array(
         [_unit_to_meters(u) for u in dims.units], dtype=float)
+    if global_scale_phys.size == 0:
+        raise ValueError(
+            "refine: the viewer has no global dimensions (viewer.state.dimensions "
+            "is empty), so there is no coordinate frame to register in. Load a "
+            "state that has top-level 'dimensions' (e.g. python -i ngregister.py "
+            "--url ...), or set viewer.dimensions, then retry.")
     scale_global = global_scale_phys / np.min(global_scale_phys)
     ndim = len(global_scale_phys)
 
