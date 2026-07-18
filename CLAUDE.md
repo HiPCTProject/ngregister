@@ -87,15 +87,18 @@ libraries disagree on axis order:
   stored at a different resolution than the global frame. `_native_voxel_geometry` recovers the
   per-axis `(ratio, offset)` that turns an array index into that intrinsic coordinate from the
   source's resolution metadata (OME `coordinateTransformations` for zarr via `_ome_multiscale`,
-  precomputed `resolution`); `fetch_layer_image` composes it with the transform into the full
+  precomputed `resolution`, N5-Viewer `resolution`/`downsamplingFactors`/`units` via
+  `_n5_multiscale_group`); `fetch_layer_image` composes it with the transform into the full
   array-index -> global-voxel affine used for both the box clamp and the SimpleITK geometry. Without
   this an OME overview level (e.g. 20 um data in a 4 um frame) maps the box ~5x too far and misses
   the array bounds (issue #5). Falls back to `(1, 0)` when no resolution metadata is found.
 - TensorStore opens the source lazily (precomputed, zarr, sharded zarr3, n5) and only the small
   cutout is read; the returned array's axes are in the source's stored order (= the transform's
   column order). `source_url_to_spec` builds the open spec (driver + kvstore + `scale_index`) purely;
-  `_open_source` opens it and, if a zarr source is an OME multiscale *group*, resolves the level path
-  from the metadata on a retry. `_spatial_axis_order` uses TensorStore dimension labels to drop the
+  `_open_source` opens it and, if a source is a multiscale *group* rather than a single array (a zarr
+  OME group, or an N5-Viewer group whose URL points at the `attributes.json` with
+  `downsamplingFactors` and `sN` level arrays), resolves the level path from the metadata on a retry.
+  `_spatial_axis_order` uses TensorStore dimension labels to drop the
   channel axis and confirm spatial axes (no hardcoded x-first assumption).
 - SimpleITK images are indexed `(x, y, z)` but `Get/SetImageFromArray` use reversed `[z, y, x]`;
   geometry is physical via origin/spacing/direction.

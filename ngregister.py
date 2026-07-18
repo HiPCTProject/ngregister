@@ -386,9 +386,35 @@ def _ome_multiscale(driver, kvstore):
             multiscales = ome.get("multiscales")
     elif driver == "zarr":
         multiscales = (_read_json_key(kvstore, ".zattrs") or {}).get("multiscales")
+    elif driver == "n5":
+        # N5 can carry OME-NGFF metadata in the group attributes.json; the
+        # common N5-Viewer format instead uses `downsamplingFactors` (handled
+        # separately) and has no `multiscales` key, so this returns None there.
+        attrs = _read_json_key(kvstore, "attributes.json") or {}
+        ome = attrs.get("ome", attrs)
+        multiscales = ome.get("multiscales")
     else:
         multiscales = None
     return multiscales[0] if multiscales else None
+
+
+def _n5_multiscale_group(kvstore):
+    """Return the N5 group ``attributes.json`` when ``kvstore`` is a multiscale
+    group, else None.
+
+    Neuroglancer points an N5 source at the multiscale *group*, whose
+    ``attributes.json`` carries downsampling metadata (N5-Viewer:
+    ``downsamplingFactors`` / ``resolution`` / ``units`` / ``multiScale``) and
+    whose resolution levels live in child arrays ``s0``, ``s1``, .... An N5
+    *array* instead has ``dimensions`` in its ``attributes.json``, which is what
+    TensorStore's n5 driver needs the kvstore to point at -- so a group has to be
+    resolved to a level first. A group is any ``attributes.json`` that exists and
+    lacks ``dimensions``; a plain array (has ``dimensions``) returns None.
+    """
+    attrs = _read_json_key(kvstore, "attributes.json")
+    if attrs is None or "dimensions" in attrs:
+        return None
+    return attrs
 
 
 def _resolve_multiscale_kvstore(driver, kvstore, mip):
@@ -403,6 +429,9 @@ def _resolve_multiscale_kvstore(driver, kvstore, mip):
     if multiscale:
         datasets = multiscale["datasets"]
         return kvstore.rstrip("/") + "/" + datasets[int(mip)]["path"]
+    if driver == "n5" and _n5_multiscale_group(kvstore) is not None:
+        # N5-Viewer levels are named s0, s1, ...
+        return kvstore.rstrip("/") + "/s" + str(int(mip))
     return kvstore
 
 
@@ -431,7 +460,7 @@ def _native_voxel_geometry(url, mip, spatial, global_scale_phys):
     native_scale_m = None
     native_trans_m = None
 
-    if driver in ("zarr", "zarr3"):
+    if driver in ("zarr", "zarr3", "n5"):
         multiscale = _ome_multiscale(driver, kvstore)
         if multiscale:
             axes = multiscale.get("axes", [])
@@ -449,6 +478,25 @@ def _native_voxel_geometry(url, mip, spatial, global_scale_phys):
                 if translation is not None:
                     native_trans_m = [translation[a] * f
                                       for a, f in zip(spatial, factors)]
+        if native_scale_m is None and driver == "n5":
+            # N5-Viewer group metadata: base `resolution` in `units`, per-level
+            # `downsamplingFactors` (or `scales`). No translation in this format.
+            attrs = _n5_multiscale_group(kvstore) or {}
+            resolution = attrs.get("resolution") or attrs.get("pixelResolution")
+            units = attrs.get("units")
+            if isinstance(resolution, dict):        # pixelResolution: {dimensions, unit}
+                units = units or resolution.get("unit")
+                resolution = resolution.get("dimensions")
+            factors = attrs.get("downsamplingFactors") or attrs.get("scales")
+            if resolution is not None:
+                if units is None or isinstance(units, str):
+                    units = [units] * len(resolution)
+                level = ([1] * len(resolution) if not factors
+                         else factors[min(int(mip), len(factors) - 1)])
+                native_scale_m = [
+                    resolution[a] * level[a]
+                    * _unit_to_meters(units[a] if a < len(units) else None)
+                    for a in spatial]
     elif driver == "neuroglancer_precomputed":
         info = _read_json_key(kvstore, "info")
         scales = (info or {}).get("scales")
@@ -499,7 +547,7 @@ def _open_source(url, mip):
     try:
         return ts.open(spec).result()
     except Exception as exc:
-        if spec["driver"] in ("zarr", "zarr3"):
+        if spec["driver"] in ("zarr", "zarr3", "n5"):
             resolved = _resolve_multiscale_kvstore(spec["driver"], spec["kvstore"], mip)
             if resolved != spec["kvstore"]:
                 return ts.open({**spec, "kvstore": resolved}).result()

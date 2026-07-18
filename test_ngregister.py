@@ -143,6 +143,42 @@ def _write_ome_zarr3_levels(dirpath, arrays, scales, unit="nanometer"):
     return "zarr3://file://" + str(dirpath) + "/"
 
 
+def _write_n5_multiscale(dirpath, arrays, resolution, units="um"):
+    """Write an N5-Viewer multiscale group (levels s0..sN); return source URL.
+
+    ``arrays[i]`` is the level-i volume (stored [x, y, z]); ``resolution`` is the
+    level-0 voxel size in ``units``. The group ``attributes.json`` carries
+    ``resolution`` / ``units`` / ``downsamplingFactors`` but no ``dimensions``,
+    so opening it as an array fails and the refinement must descend to the ``sN``
+    level -- the real N5 case this supports.
+    """
+    dirpath.mkdir(parents=True, exist_ok=True)
+    factors = []
+    for level, array in enumerate(arrays):
+        data = _u16(array)
+        factors.append([round(a0 / a) for a0, a in zip(arrays[0].shape, array.shape)])
+        ts.open({
+            "driver": "n5",
+            "kvstore": "file://" + str(dirpath) + "/s" + str(level) + "/",
+            "create": True, "delete_existing": True,
+            "metadata": {
+                "dimensions": list(data.shape),
+                "blockSize": [min(64, s) for s in data.shape],
+                "dataType": "uint16",
+                "compression": {"type": "raw"},
+            },
+        }).result()[...] = data
+    group_meta = {
+        "axes": ["x", "y", "z"],
+        "resolution": list(resolution),
+        "units": [units] * len(resolution),
+        "downsamplingFactors": factors,
+        "multiScale": True,
+    }
+    (dirpath / "attributes.json").write_text(json.dumps(group_meta))
+    return "n5://file://" + str(dirpath) + "/"
+
+
 def _state(scales, landmark, fixed_layer, moving_layer, units="nm"):
     state = neuroglancer.ViewerState()
     state.dimensions = neuroglancer.CoordinateSpace(
@@ -370,6 +406,55 @@ def test_refine_per_layer_mip_compares_chosen_levels(monkeypatch, tmp_path):
     assert np.allclose(correction[:3, :3], np.eye(3), atol=0.05)
 
 
+def test_refine_n5_multiscale_group(monkeypatch, tmp_path):
+    """Open N5 layers whose source URL points at the multiscale group.
+
+    Neuroglancer points an N5 source at the group (attributes.json with
+    `resolution`/`downsamplingFactors`, no `dimensions`); the refinement must
+    detect the group, descend to the `s0` level, and read the N5-Viewer `um`
+    geometry -- here matched to the global frame so the box maps 1:1.
+    """
+    resolution = [2.256, 2.256, 2.256]                 # um, == global frame below
+    shift = np.array([2.0, -1.0, 1.0])
+    vol = _texture()
+    moving = ndi.shift(vol, shift, order=1, mode="reflect")
+
+    fixed_url = _write_n5_multiscale(tmp_path / "fixed", [vol], resolution)
+    moving_url = _write_n5_multiscale(tmp_path / "moving", [moving], resolution)
+    state = _state(resolution, [50, 50, 50],
+                   _image_layer(fixed_url), _image_layer(moving_url), units="um")
+    monkeypatch.setattr(ngregister, "viewer", types.SimpleNamespace(state=state))
+
+    correction = ngregister.refine_registration(size_voxels=60, apply=False)
+    _assert_cancels_shift(correction, shift)
+
+
+def test_refine_n5_per_layer_mip_compares_chosen_levels(monkeypatch, tmp_path):
+    """Fetch a decimated N5 level and validate the `downsamplingFactors` geometry.
+
+    The moving source is a 2-level N5 group; fetched at ``moving_mip=1`` the
+    refinement must resolve the ``s1`` path and scale its native voxel size by
+    ``downsamplingFactors[1]`` (2x), place the cutout in the same global frame as
+    the full-res fixed layer, and still recover the injected shift.
+    """
+    resolution = [2.256, 2.256, 2.256]                 # um, == global frame
+    shift = np.array([4.0, -2.0, 2.0])                 # even -> exact under 2x decimation
+    vol = _texture()
+    moving = ndi.shift(vol, shift, order=1, mode="reflect")
+
+    fixed_url = _write_n5_multiscale(tmp_path / "fixed", [vol], resolution)
+    moving_url = _write_n5_multiscale(
+        tmp_path / "moving", [moving, moving[::2, ::2, ::2]], resolution)
+    state = _state(resolution, [50, 50, 50],
+                   _image_layer(fixed_url), _image_layer(moving_url), units="um")
+    monkeypatch.setattr(ngregister, "viewer", types.SimpleNamespace(state=state))
+
+    correction = ngregister.refine_registration(
+        size_voxels=80, apply=False, fixed_mip=0, moving_mip=1)
+    assert np.linalg.norm(correction[:3, 3] - (-shift)) < 2.0
+    assert np.allclose(correction[:3, :3], np.eye(3), atol=0.05)
+
+
 # ---------------------------------------------------------------------------
 # Unit tests
 # ---------------------------------------------------------------------------
@@ -495,6 +580,8 @@ def test_source_url_to_spec_selects_driver_and_scale():
                     "kvstore": "gs://b/p", "scale_index": 2}
     spec = ngregister.source_url_to_spec("zarr3://https://h/d.zarr")
     assert spec["driver"] == "zarr3" and spec["kvstore"] == "https://h/d.zarr"
+    spec = ngregister.source_url_to_spec("n5://gs://b/p")
+    assert spec == {"driver": "n5", "kvstore": "gs://b/p"}
 
 
 def test_resolve_roles_prefers_name_prefixes():
